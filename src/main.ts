@@ -1,9 +1,12 @@
 import 'zone.js';
 import '@angular/compiler';
 import { bootstrapApplication } from '@angular/platform-browser';
+import { inject } from '@vercel/analytics';
 import { AppComponent } from './app.component';
 
 console.log('Bootstrapping PumpSimulator...');
+
+inject();
 
 bootstrapApplication(AppComponent, {
   providers: []
