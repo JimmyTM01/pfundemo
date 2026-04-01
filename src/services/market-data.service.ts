@@ -46,7 +46,7 @@ export interface PumpPortalTrade {
 export class MarketDataService {
   
   // SOL Price for conversions (PumpPortal gives data in SOL)
-  private solPriceUsd = 200; // Better default
+  private solPriceUsd = 200;
   
   // WebSocket State
   private socket$: WebSocketSubject<any> | null = null;
@@ -56,8 +56,6 @@ export class MarketDataService {
   constructor() {
     this.fetchSolPrice();
     this.connectWebSocket();
-    
-    // Refresh SOL price every 60 seconds to keep USD valuations accurate
     interval(60000).subscribe(() => this.fetchSolPrice());
   }
 
@@ -65,7 +63,6 @@ export class MarketDataService {
 
   async fetchSolPrice() {
     try {
-      // Fetch SOL price from DexScreener (using Wrapped SOL address)
       const response = await fetch('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112');
       if (response.ok) {
         const data = await response.json();
@@ -87,7 +84,11 @@ export class MarketDataService {
       if (!response.ok) return null;
       const data = await response.json();
 
-      // Convert pump.fun format to our TokenData format
+      // Calculate real price from official data
+      // usd_market_cap / 1B token supply
+      const mcapUsd = parseFloat(data.usd_market_cap) || 0;
+      const priceUsd = mcapUsd / 1_000_000_000;
+
       return {
         chainId: 'solana',
         dexId: 'pumpfun',
@@ -98,8 +99,8 @@ export class MarketDataService {
           name: data.name,
           symbol: data.symbol
         },
-        priceUsd: (parseFloat(data.usd_market_cap) / 1000000000).toString(),
-        fdv: parseFloat(data.usd_market_cap),
+        priceUsd: priceUsd.toString(),
+        fdv: mcapUsd,
         isPump: true,
         info: {
           imageUrl: data.image_uri
@@ -114,23 +115,22 @@ export class MarketDataService {
   async getTokenData(mintAddress: string): Promise<TokenData | null> {
     if (!mintAddress || mintAddress.length < 10) return null;
 
+    // Always try Pump.fun first to ensure official data for newly bought tokens
+    const pumpData = await this.getPumpTokenData(mintAddress);
+    if (pumpData) return pumpData;
+
     try {
       const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`);
-      
-      if (!response.ok) return this.getPumpTokenData(mintAddress);
+      if (!response.ok) return null;
 
       const data = await response.json();
-      
-      if (!data.pairs || data.pairs.length === 0) {
-        // Fallback to pump.fun if DexScreener has no data
-        return this.getPumpTokenData(mintAddress);
-      }
+      if (!data.pairs || data.pairs.length === 0) return null;
 
       const sortedPairs = data.pairs.sort((a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
       return sortedPairs[0] as TokenData;
     } catch (error) {
       console.warn('Error fetching token data:', error);
-      return this.getPumpTokenData(mintAddress);
+      return null;
     }
   }
 
@@ -152,15 +152,14 @@ export class MarketDataService {
           console.log('PumpPortal WS Closed');
           this.isConnected.set(false);
           this.socket$ = null;
-          // Simple reconnect logic via timeout
           setTimeout(() => this.connectWebSocket(), 3000);
         }
       }
     });
 
     this.socket$.pipe(
-      retry({ delay: 3000 }), // Retry connection if it fails
-      filter(msg => msg && msg.mint) // Only pass valid trade messages
+      retry({ delay: 3000 }),
+      filter(msg => msg && msg.mint)
     ).subscribe({
       next: (msg: PumpPortalTrade) => this.tradeUpdates$.next(msg),
       error: (err) => console.error('WS Error:', err)
@@ -193,8 +192,6 @@ export class MarketDataService {
     }
   }
 
-  // Helper to convert SOL market cap to USD price
-  // Assumption: Standard Pump.fun token supply is 1 Billion
   convertSolMcapToUsd(mcapSol: number): { priceUsd: number, mcapUsd: number } {
     const safeMcapSol = mcapSol || 0;
     const mcapUsd = safeMcapSol * this.solPriceUsd;

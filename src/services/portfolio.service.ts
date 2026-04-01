@@ -1,6 +1,8 @@
 import { Injectable, signal, computed, inject, effect, untracked } from '@angular/core';
 import { MarketDataService, TokenData } from './market-data.service';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { interval } from 'rxjs';
+import { switchMap, tap } from 'rxjs/operators';
 
 export interface Position {
   id: string;
@@ -46,14 +48,26 @@ export class PortfolioService {
     // 1. Load saved state immediately on startup
     this.loadState();
 
-    // 2. Listen for real-time trade updates from PumpPortal
+    // 2. Listen for real-time trade updates from PumpPortal (Ultra-fast updates)
     this.marketService.tradeUpdates$
       .pipe(takeUntilDestroyed())
       .subscribe(trade => {
         this.updatePositionFromTrade(trade);
       });
 
-    // 3. Auto-save state whenever signals change
+    // 3. Official Pump.fun API Polling (Reliable/Official updates)
+    // Poll every 2 seconds for all active positions
+    interval(2000).pipe(
+      takeUntilDestroyed(),
+      tap(() => {
+        const currentPositions = this.positions();
+        if (currentPositions.length > 0) {
+          currentPositions.forEach(pos => this.refreshPositionFromOfficialApi(pos));
+        }
+      })
+    ).subscribe();
+
+    // 4. Auto-save state whenever signals change
     effect(() => {
       const state = {
         cashBalance: this.cashBalance(),
@@ -63,23 +77,41 @@ export class PortfolioService {
       localStorage.setItem(this.STORAGE_KEY, JSON.stringify(state));
     });
 
-    // 4. CONNECTION RECOVERY LOGIC (Crucial for live updates)
-    // Whenever the socket connects (initially or after drop), re-subscribe to all held positions.
+    // 5. CONNECTION RECOVERY LOGIC (WebSocket)
     effect(() => {
       if (this.marketService.isConnected()) {
         untracked(() => {
           const currentPositions = this.positions();
-          console.log(`Connected. Subscribing to all pump.fun trades and ${currentPositions.length} specific tokens.`);
-
-          // Double subscription strategy for maximum reliability
           this.marketService.subscribeAllTokenTrades();
-
           if (currentPositions.length > 0) {
             currentPositions.forEach(p => this.marketService.subscribeToMint(p.mint));
           }
         });
       }
     });
+  }
+
+  private async refreshPositionFromOfficialApi(pos: Position) {
+    try {
+      const data = await this.marketService.getPumpTokenData(pos.mint);
+      if (data) {
+        const priceUsd = parseFloat(data.priceUsd);
+        const mcapUsd = data.fdv || 0;
+
+        if (priceUsd > 0) {
+          this.positions.update(current =>
+            current.map(p => p.mint === pos.mint ? {
+              ...p,
+              currentPrice: priceUsd,
+              currentMcap: mcapUsd,
+              lastUpdate: Date.now()
+            } : p)
+          );
+        }
+      }
+    } catch (e) {
+      console.warn('Official API polling error:', e);
+    }
   }
 
   // Derived State
@@ -106,8 +138,6 @@ export class PortfolioService {
         
         const savedPositions: Position[] = state.positions || [];
         this.positions.set(savedPositions);
-
-        console.log(`Restored ${savedPositions.length} positions from storage.`);
       } catch (e) {
         console.error('Failed to parse saved state', e);
       }
@@ -115,20 +145,17 @@ export class PortfolioService {
   }
 
   private updatePositionFromTrade(trade: any) {
-    // Robust mint matching
     const mint = trade.mint;
     if (!mint) return;
 
     const hasPosition = this.positions().some(p => p.mint === mint);
     if (!hasPosition) return;
 
-    // PumpPortal often provides marketCapSol, but sometimes it might be differently named in 'subscribeAll'
-    const mcapSol = trade.marketCapSol || trade.vSolInBondingCurve; // Fallback to vSol if mcapSol missing
+    const mcapSol = trade.marketCapSol || trade.vSolInBondingCurve;
     if (!mcapSol) return;
 
     const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(mcapSol);
     
-    // Only update if we have a valid price
     if (priceUsd <= 0) return;
 
     this.positions.update(currentPositions => {
@@ -152,7 +179,6 @@ export class PortfolioService {
       return;
     }
 
-    // Sanitize Mint Address
     let cleanMint = mintAddress.trim();
     if (cleanMint.includes('/')) {
       const parts = cleanMint.split('/');
@@ -171,8 +197,8 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      // Get Initial Data
-      const data = await this.marketService.getTokenData(cleanMint);
+      // Prioritize Pump.fun data for new tokens
+      const data = await this.marketService.getPumpTokenData(cleanMint) || await this.marketService.getTokenData(cleanMint);
       
       if (!data) {
         this.error.set("Token not found or no liquidity.");
@@ -210,7 +236,6 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
-      // Subscribe specifically to this token for better reliability
       this.marketService.subscribeToMint(data.baseToken.address);
 
     } catch (e) {
@@ -227,7 +252,6 @@ export class PortfolioService {
     this.isLoading.set(true);
 
     try {
-      // Use current price from signal (which is updated via WS) for execution
       const executionPrice = pos.currentPrice;
       const executionMcap = pos.currentMcap;
 
@@ -247,7 +271,6 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
-      // No need to unsubscribe if we use 'subscribeAll' for others, but good for cleanliness
       this.marketService.unsubscribeFromMint(pos.mint);
 
     } catch (e) {
@@ -258,9 +281,7 @@ export class PortfolioService {
   }
 
   reset() {
-    // Clean up all subscriptions
     this.positions().forEach(p => this.marketService.unsubscribeFromMint(p.mint));
-
     this.cashBalance.set(100);
     this.positions.set([]);
     this.history.set([]);
