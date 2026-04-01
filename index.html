@@ -10,6 +10,7 @@
       font-family: 'Space Grotesk', sans-serif;
       background-color: #0f172a;
       color: #e2e8f0;
+      margin: 0;
     }
     .neon-text {
       text-shadow: 0 0 10px rgba(139, 92, 246, 0.5);
@@ -19,7 +20,6 @@
       backdrop-filter: blur(10px);
       border: 1px solid rgba(255, 255, 255, 0.1);
     }
-    /* Custom Scrollbar */
     ::-webkit-scrollbar {
       width: 8px;
     }
@@ -34,10 +34,9 @@
       background: #64748b;
     }
   </style>
-  
 </head>
 <body>
-  <app-root></app-root>
-  <script type="module" src="/src/main.ts"></script>
+  <div id="root"></div>
+  <script type="module" src="/src/main.tsx"></script>
 </body>
 </html>
