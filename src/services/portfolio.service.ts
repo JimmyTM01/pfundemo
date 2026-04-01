@@ -64,12 +64,19 @@ export class PortfolioService {
     });
 
     // 4. CONNECTION RECOVERY LOGIC (Crucial for live updates)
-    // Whenever the socket connects (initially or after drop), subscribe to all trades.
+    // Whenever the socket connects (initially or after drop), re-subscribe to all held positions.
     effect(() => {
       if (this.marketService.isConnected()) {
         untracked(() => {
-          console.log(`Connection restored. Subscribing to all pump.fun trades.`);
+          const currentPositions = this.positions();
+          console.log(`Connected. Subscribing to all pump.fun trades and ${currentPositions.length} specific tokens.`);
+
+          // Double subscription strategy for maximum reliability
           this.marketService.subscribeAllTokenTrades();
+
+          if (currentPositions.length > 0) {
+            currentPositions.forEach(p => this.marketService.subscribeToMint(p.mint));
+          }
         });
       }
     });
@@ -108,18 +115,25 @@ export class PortfolioService {
   }
 
   private updatePositionFromTrade(trade: any) {
-    // Only update if we hold this token
-    const hasPosition = this.positions().some(p => p.mint === trade.mint);
+    // Robust mint matching
+    const mint = trade.mint;
+    if (!mint) return;
+
+    const hasPosition = this.positions().some(p => p.mint === mint);
     if (!hasPosition) return;
 
-    const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(trade.marketCapSol);
+    // PumpPortal often provides marketCapSol, but sometimes it might be differently named in 'subscribeAll'
+    const mcapSol = trade.marketCapSol || trade.vSolInBondingCurve; // Fallback to vSol if mcapSol missing
+    if (!mcapSol) return;
+
+    const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(mcapSol);
     
-    // Only update if we have a valid price (SOL price might be missing initially)
+    // Only update if we have a valid price
     if (priceUsd <= 0) return;
 
     this.positions.update(currentPositions => {
       return currentPositions.map(pos => {
-        if (pos.mint === trade.mint) {
+        if (pos.mint === mint) {
           return {
             ...pos,
             currentPrice: priceUsd,
@@ -196,6 +210,9 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
+      // Subscribe specifically to this token for better reliability
+      this.marketService.subscribeToMint(data.baseToken.address);
+
     } catch (e) {
       this.error.set("Failed to execute buy.");
     } finally {
@@ -230,6 +247,9 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
+      // No need to unsubscribe if we use 'subscribeAll' for others, but good for cleanliness
+      this.marketService.unsubscribeFromMint(pos.mint);
+
     } catch (e) {
       this.error.set("Failed to execute sell.");
     } finally {
@@ -238,6 +258,9 @@ export class PortfolioService {
   }
 
   reset() {
+    // Clean up all subscriptions
+    this.positions().forEach(p => this.marketService.unsubscribeFromMint(p.mint));
+
     this.cashBalance.set(100);
     this.positions.set([]);
     this.history.set([]);

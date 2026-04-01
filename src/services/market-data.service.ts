@@ -46,7 +46,7 @@ export interface PumpPortalTrade {
 export class MarketDataService {
   
   // SOL Price for conversions (PumpPortal gives data in SOL)
-  private solPriceUsd = 0;
+  private solPriceUsd = 200; // Better default
   
   // WebSocket State
   private socket$: WebSocketSubject<any> | null = null;
@@ -70,13 +70,14 @@ export class MarketDataService {
       if (response.ok) {
         const data = await response.json();
         if (data.pairs && data.pairs.length > 0) {
-          this.solPriceUsd = parseFloat(data.pairs[0].priceUsd);
-          // console.log('SOL Price updated:', this.solPriceUsd);
+          const price = parseFloat(data.pairs[0].priceUsd);
+          if (price > 0) {
+            this.solPriceUsd = price;
+          }
         }
       }
     } catch (e) {
-      console.warn('Failed to fetch SOL price, defaulting to 150', e);
-      if (this.solPriceUsd === 0) this.solPriceUsd = 150; // Fallback only if never set
+      console.warn('Failed to fetch SOL price, using fallback', e);
     }
   }
 
@@ -116,7 +117,7 @@ export class MarketDataService {
     try {
       const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`);
       
-      if (!response.ok) return null;
+      if (!response.ok) return this.getPumpTokenData(mintAddress);
 
       const data = await response.json();
       
@@ -195,7 +196,8 @@ export class MarketDataService {
   // Helper to convert SOL market cap to USD price
   // Assumption: Standard Pump.fun token supply is 1 Billion
   convertSolMcapToUsd(mcapSol: number): { priceUsd: number, mcapUsd: number } {
-    const mcapUsd = mcapSol * (this.solPriceUsd || 0);
+    const safeMcapSol = mcapSol || 0;
+    const mcapUsd = safeMcapSol * this.solPriceUsd;
     const priceUsd = mcapUsd / 1_000_000_000; 
     return { priceUsd, mcapUsd };
   }
