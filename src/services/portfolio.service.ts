@@ -88,12 +88,15 @@ export class PortfolioService {
     });
   }
 
-  // Public manual refresh method
+  // Public manual refresh method - Ensures WebSocket is also re-synced
   async refreshPosition(positionId: string) {
     const pos = this.positions().find(p => p.id === positionId);
     if (!pos) return;
 
     this.setRefreshing(positionId, true);
+    // 1. Re-subscribe to WebSocket to be safe
+    this.marketService.subscribeToMint(pos.mint);
+    // 2. Fetch absolute latest from Official API
     await this.refreshPositionFromOfficialApi(pos);
     this.setRefreshing(positionId, false);
   }
@@ -258,8 +261,18 @@ export class PortfolioService {
     this.isLoading.set(true);
 
     try {
-      const executionPrice = pos.currentPrice;
-      const executionMcap = pos.currentMcap;
+      // 1. Fetch the absolute latest price from the official API before selling
+      const data = await this.marketService.getPumpTokenData(pos.mint);
+      let executionPrice = pos.currentPrice;
+      let executionMcap = pos.currentMcap;
+
+      if (data) {
+        const officialPrice = parseFloat(data.priceUsd);
+        if (officialPrice > 0) {
+          executionPrice = officialPrice;
+          executionMcap = data.fdv || executionMcap;
+        }
+      }
 
       const sellValue = pos.amountTokens * executionPrice;
       const pnl = sellValue - pos.investedAmount;
