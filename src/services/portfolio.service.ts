@@ -15,6 +15,7 @@ export interface Position {
   entryMcap: number;
   currentMcap: number;
   timestamp: number;
+  lastUpdate?: number; // For visual feedback
 }
 
 export interface TradeHistory {
@@ -63,15 +64,12 @@ export class PortfolioService {
     });
 
     // 4. CONNECTION RECOVERY LOGIC (Crucial for live updates)
-    // Whenever the socket connects (initially or after drop), re-subscribe to all held positions.
+    // Whenever the socket connects (initially or after drop), subscribe to all trades.
     effect(() => {
       if (this.marketService.isConnected()) {
         untracked(() => {
-          const currentPositions = this.positions();
-          if (currentPositions.length > 0) {
-            console.log(`Connection restored. Re-subscribing ${currentPositions.length} positions.`);
-            currentPositions.forEach(p => this.marketService.subscribeToMint(p.mint));
-          }
+          console.log(`Connection restored. Subscribing to all pump.fun trades.`);
+          this.marketService.subscribeAllTokenTrades();
         });
       }
     });
@@ -102,7 +100,6 @@ export class PortfolioService {
         const savedPositions: Position[] = state.positions || [];
         this.positions.set(savedPositions);
 
-        // Initial subscription is now handled by the effect above when connection opens
         console.log(`Restored ${savedPositions.length} positions from storage.`);
       } catch (e) {
         console.error('Failed to parse saved state', e);
@@ -111,6 +108,10 @@ export class PortfolioService {
   }
 
   private updatePositionFromTrade(trade: any) {
+    // Only update if we hold this token
+    const hasPosition = this.positions().some(p => p.mint === trade.mint);
+    if (!hasPosition) return;
+
     const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(trade.marketCapSol);
     
     // Only update if we have a valid price (SOL price might be missing initially)
@@ -122,7 +123,8 @@ export class PortfolioService {
           return {
             ...pos,
             currentPrice: priceUsd,
-            currentMcap: mcapUsd
+            currentMcap: mcapUsd,
+            lastUpdate: Date.now()
           };
         }
         return pos;
@@ -155,7 +157,7 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      // Get Initial Data from DexScreener (Metadata + Price)
+      // Get Initial Data
       const data = await this.marketService.getTokenData(cleanMint);
       
       if (!data) {
@@ -173,7 +175,6 @@ export class PortfolioService {
         mint: data.baseToken.address,
         symbol: data.baseToken.symbol,
         name: data.baseToken.name,
-        // Use seeded image generator if no image is returned, ensuring uniqueness per token
         imageUrl: data.info?.imageUrl || `https://picsum.photos/seed/${data.baseToken.address}/200`,
         entryPrice: price,
         currentPrice: price,
@@ -194,9 +195,6 @@ export class PortfolioService {
         marketCap: mcap,
         timestamp: Date.now()
       }, ...h]);
-
-      // SUBSCRIBE TO WEBSOCKET FOR UPDATES
-      this.marketService.subscribeToMint(data.baseToken.address);
 
     } catch (e) {
       this.error.set("Failed to execute buy.");
@@ -232,9 +230,6 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
-      // UNSUBSCRIBE FROM WEBSOCKET
-      this.marketService.unsubscribeFromMint(pos.mint);
-
     } catch (e) {
       this.error.set("Failed to execute sell.");
     } finally {
@@ -243,11 +238,6 @@ export class PortfolioService {
   }
 
   reset() {
-    // Unsubscribe all
-    this.positions().forEach(p => {
-      this.marketService.unsubscribeFromMint(p.mint);
-    });
-
     this.cashBalance.set(100);
     this.positions.set([]);
     this.history.set([]);

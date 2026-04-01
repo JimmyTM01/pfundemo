@@ -4,6 +4,7 @@ import { filter, retry } from 'rxjs/operators';
 import { Subject, interval } from 'rxjs';
 
 export interface TokenData {
+  isPump?: boolean;
   chainId: string;
   dexId: string;
   url: string;
@@ -79,6 +80,36 @@ export class MarketDataService {
     }
   }
 
+  async getPumpTokenData(mintAddress: string): Promise<TokenData | null> {
+    try {
+      const response = await fetch(`https://frontend-api.pump.fun/coins/${mintAddress}`);
+      if (!response.ok) return null;
+      const data = await response.json();
+
+      // Convert pump.fun format to our TokenData format
+      return {
+        chainId: 'solana',
+        dexId: 'pumpfun',
+        url: `https://pump.fun/${mintAddress}`,
+        pairAddress: data.raydium_pool || '',
+        baseToken: {
+          address: data.mint,
+          name: data.name,
+          symbol: data.symbol
+        },
+        priceUsd: (parseFloat(data.usd_market_cap) / 1000000000).toString(),
+        fdv: parseFloat(data.usd_market_cap),
+        isPump: true,
+        info: {
+          imageUrl: data.image_uri
+        }
+      };
+    } catch (e) {
+      console.warn('Pump.fun API error:', e);
+      return null;
+    }
+  }
+
   async getTokenData(mintAddress: string): Promise<TokenData | null> {
     if (!mintAddress || mintAddress.length < 10) return null;
 
@@ -89,13 +120,16 @@ export class MarketDataService {
 
       const data = await response.json();
       
-      if (!data.pairs || data.pairs.length === 0) return null;
+      if (!data.pairs || data.pairs.length === 0) {
+        // Fallback to pump.fun if DexScreener has no data
+        return this.getPumpTokenData(mintAddress);
+      }
 
       const sortedPairs = data.pairs.sort((a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
       return sortedPairs[0] as TokenData;
     } catch (error) {
       console.warn('Error fetching token data:', error);
-      return null;
+      return this.getPumpTokenData(mintAddress);
     }
   }
 
@@ -139,8 +173,14 @@ export class MarketDataService {
         keys: [mint]
       });
     }
-    // Removed the recursive setTimeout logic here as it causes issues.
-    // Re-subscription is now handled reactively in PortfolioService.
+  }
+
+  subscribeAllTokenTrades() {
+    if (this.socket$ && this.isConnected()) {
+      this.socket$.next({
+        method: "subscribeAllTokenTrades"
+      });
+    }
   }
 
   unsubscribeFromMint(mint: string) {
