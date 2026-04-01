@@ -140,13 +140,19 @@ import { StatCardComponent } from '../ui/stat-card.component';
                   </div>
                 </div>
 
-                <!-- Sell Action (Mobile) -->
-                <button (click)="portfolio.sellPosition(pos.id)"
-                    [disabled]="portfolio.isLoading()"
-                    class="md:hidden bg-red-500/10 hover:bg-red-500 hover:text-white text-red-400 border border-red-500/30 py-1.5 px-3 rounded-lg font-bold text-[10px] transition-all disabled:opacity-50">
-                  <ng-container *ngIf="portfolio.isLoading(); else sellLabel">SELLING...</ng-container>
-                  <ng-template #sellLabel>SELL ALL</ng-template>
-                </button>
+                <!-- Actions (Mobile) -->
+                <div class="flex gap-2 md:hidden">
+                  <button (click)="portfolio.refreshPosition(pos.id)"
+                      [disabled]="pos.isRefreshing"
+                      class="bg-blue-500/10 hover:bg-blue-500 hover:text-white text-blue-400 border border-blue-500/30 py-1.5 px-3 rounded-lg font-bold text-[10px] transition-all disabled:opacity-50">
+                    {{ pos.isRefreshing ? '...' : 'REFRESH' }}
+                  </button>
+                  <button (click)="portfolio.sellPosition(pos.id)"
+                      [disabled]="portfolio.isLoading()"
+                      class="bg-red-500/10 hover:bg-red-500 hover:text-white text-red-400 border border-red-500/30 py-1.5 px-3 rounded-lg font-bold text-[10px] transition-all disabled:opacity-50">
+                    {{ portfolio.isLoading() ? '...' : 'SELL ALL' }}
+                  </button>
+                </div>
               </div>
 
               <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -181,8 +187,14 @@ import { StatCardComponent } from '../ui/stat-card.component';
                   </div>
                 </div>
 
-                <!-- Action (Desktop) -->
+                <!-- Actions (Desktop) -->
                 <div class="hidden md:flex flex-col gap-2 items-end min-w-[120px]">
+                   <button (click)="portfolio.refreshPosition(pos.id)"
+                      [disabled]="pos.isRefreshing"
+                      class="w-full bg-blue-500/10 hover:bg-blue-500 hover:text-white text-blue-400 border border-blue-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">
+                     <ng-container *ngIf="pos.isRefreshing; else refreshLabel">REFRESHING...</ng-container>
+                     <ng-template #refreshLabel>REFRESH</ng-template>
+                   </button>
                    <button (click)="portfolio.sellPosition(pos.id)"
                       [disabled]="portfolio.isLoading()"
                       class="w-full bg-red-500/10 hover:bg-red-500 hover:text-white text-red-400 border border-red-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">

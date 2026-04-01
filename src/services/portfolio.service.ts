@@ -18,6 +18,7 @@ export interface Position {
   currentMcap: number;
   timestamp: number;
   lastUpdate?: number; // For visual feedback
+  isRefreshing?: boolean; // Manual refresh state
 }
 
 export interface TradeHistory {
@@ -85,6 +86,22 @@ export class PortfolioService {
         });
       }
     });
+  }
+
+  // Public manual refresh method
+  async refreshPosition(positionId: string) {
+    const pos = this.positions().find(p => p.id === positionId);
+    if (!pos) return;
+
+    this.setRefreshing(positionId, true);
+    await this.refreshPositionFromOfficialApi(pos);
+    this.setRefreshing(positionId, false);
+  }
+
+  private setRefreshing(id: string, state: boolean) {
+    this.positions.update(list =>
+      list.map(p => p.id === id ? { ...p, isRefreshing: state } : p)
+    );
   }
 
   private async refreshPositionFromOfficialApi(pos: Position) {
