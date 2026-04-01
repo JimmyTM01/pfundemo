@@ -37,10 +37,10 @@ interface AppState {
   isConnected: boolean;
   isPolling: boolean;
 
-  // Derived
-  totalPortfolioValue: () => number;
-  totalPnL: () => number;
-  pnlPercent: () => number;
+  // Derived Values (functions because they need state)
+  getTotalPortfolioValue: () => number;
+  getTotalPnL: () => number;
+  getPnlPercent: () => number;
 
   // Actions
   setLoading: (loading: boolean) => void;
@@ -66,14 +66,14 @@ export const useStore = create<AppState>()(
       isConnected: false,
       isPolling: false,
 
-      totalPortfolioValue: () => {
-        const state = get();
-        const holdings = state.positions.reduce((acc, pos) => acc + (pos.currentPrice * pos.amountTokens), 0);
-        return state.cashBalance + holdings;
+      getTotalPortfolioValue: () => {
+        const { cashBalance, positions } = get();
+        const holdingsValue = positions.reduce((acc, pos) => acc + (pos.currentPrice * pos.amountTokens), 0);
+        return cashBalance + holdingsValue;
       },
 
-      totalPnL: () => get().totalPortfolioValue() - 100,
-      pnlPercent: () => (get().totalPnL() / 100) * 100,
+      getTotalPnL: () => get().getTotalPortfolioValue() - 100,
+      getPnlPercent: () => (get().getTotalPnL() / 100) * 100,
 
       setLoading: (isLoading) => set({ isLoading }),
       setError: (error) => set({ error }),
@@ -160,7 +160,7 @@ export const useStore = create<AppState>()(
       })
     }),
     {
-      name: 'pump-sim-state-react-v1',
+      name: 'pump-sim-state-react-v2',
       partialize: (state) => ({
         cashBalance: state.cashBalance,
         positions: state.positions,

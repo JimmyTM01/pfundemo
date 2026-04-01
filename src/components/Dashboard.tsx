@@ -11,7 +11,8 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   ExternalLink,
-  Loader2
+  Loader2,
+  Clock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -59,20 +60,21 @@ const Dashboard = () => {
 
   const onSell = async (pos: any) => {
     store.setLoading(true);
+    // Fetch absolute latest official data before selling
     const data = await getPumpTokenData(pos.mint);
     store.sellPosition(pos.id, data);
     store.setLoading(false);
   };
 
   return (
-    <div className="max-w-4xl mx-auto p-4 md:p-6 space-y-6 md:space-y-8 pb-24">
+    <div className="max-w-4xl mx-auto p-4 md:p-6 space-y-6 md:space-y-8 pb-24 text-slate-200">
 
       {/* Stats Overview */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
         <StatCard
           label="Total Equity"
-          value={formatCurrency(store.totalPortfolioValue())}
-          trend={store.totalPnL() >= 0 ? 'up' : 'down'}
+          value={formatCurrency(store.getTotalPortfolioValue())}
+          trend={store.getTotalPnL() >= 0 ? 'up' : 'down'}
         />
         <StatCard
           label="Cash"
@@ -81,9 +83,9 @@ const Dashboard = () => {
         />
         <StatCard
           label="Net P&L"
-          value={(store.totalPnL() >= 0 ? '+' : '') + formatCurrency(store.totalPnL())}
-          subValue={store.pnlPercent().toFixed(2) + '%'}
-          trend={store.totalPnL() >= 0 ? 'up' : 'down'}
+          value={(store.getTotalPnL() >= 0 ? '+' : '') + formatCurrency(store.getTotalPnL())}
+          subValue={store.getPnlPercent().toFixed(2) + '%'}
+          trend={store.getTotalPnL() >= 0 ? 'up' : 'down'}
         />
         <button
           onClick={store.reset}
@@ -172,8 +174,10 @@ const Dashboard = () => {
         <AnimatePresence mode="popLayout">
           {store.positions.length === 0 ? (
             <motion.div
+              key="empty"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
               className="text-center py-12 border-2 border-dashed border-slate-800 rounded-2xl bg-slate-900/20"
             >
               <p className="text-slate-500 text-sm">No active trades. Paste a mint above to start.</p>
@@ -299,6 +303,13 @@ const BagItem = ({ pos, onRefresh, onSell }: any) => {
             <GridItem label="Entry MC" value={formatMcap(pos.entryMcap)} />
           </div>
         </div>
+
+        {pos.lastUpdate && (
+          <div className="flex items-center gap-1 text-[8px] text-slate-600 uppercase font-bold">
+            <Clock className="w-2 h-2" />
+            Last Sync: {new Date(pos.lastUpdate).toLocaleTimeString()}
+          </div>
+        )}
       </div>
 
       {/* Background decoration */}
