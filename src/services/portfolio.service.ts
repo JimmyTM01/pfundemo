@@ -39,6 +39,7 @@ export class PortfolioService {
   readonly positions = signal<Position[]>([]);
   readonly history = signal<TradeHistory[]>([]);
   readonly isLoading = signal<boolean>(false);
+  readonly refreshingPositionId = signal<string | null>(null);
   readonly error = signal<string | null>(null);
 
   constructor() {
@@ -114,7 +115,8 @@ export class PortfolioService {
     const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(trade.marketCapSol);
     
     // Only update if we have a valid price (SOL price might be missing initially)
-    if (priceUsd <= 0) return;
+    if (!Number.isFinite(priceUsd) || priceUsd <= 0) return;
+    if (!Number.isFinite(mcapUsd) || mcapUsd <= 0) return;
 
     this.positions.update(currentPositions => {
       return currentPositions.map(pos => {
@@ -158,29 +160,80 @@ export class PortfolioService {
       // Get Initial Data from DexScreener (Metadata + Price)
       const data = await this.marketService.getTokenData(cleanMint);
       
-      if (!data) {
-        this.error.set("Token not found or no liquidity.");
+      if (data) {
+        const price = parseFloat(data.priceUsd);
+        if (!Number.isFinite(price) || price <= 0) {
+          this.error.set("Invalid token price received.");
+          this.isLoading.set(false);
+          return;
+        }
+
+        const mcap =
+          typeof data.fdv === 'number' && Number.isFinite(data.fdv) && data.fdv > 0
+            ? data.fdv
+            : price * 1_000_000_000;
+        const tokensReceived = amountUsd / price;
+
+        const newPosition: Position = {
+          id: crypto.randomUUID(),
+          mint: data.baseToken.address,
+          symbol: data.baseToken.symbol,
+          name: data.baseToken.name,
+          // Use seeded image generator if no image is returned, ensuring uniqueness per token
+          imageUrl: data.info?.imageUrl || `https://picsum.photos/seed/${data.baseToken.address}/200`,
+          entryPrice: price,
+          currentPrice: price,
+          amountTokens: tokensReceived,
+          investedAmount: amountUsd,
+          entryMcap: mcap,
+          currentMcap: mcap,
+          timestamp: Date.now()
+        };
+
+        this.cashBalance.update(b => b - amountUsd);
+        this.positions.update(p => [newPosition, ...p]);
+        this.history.update(h => [{
+          id: crypto.randomUUID(),
+          type: 'BUY',
+          symbol: data.baseToken.symbol,
+          amountUsd: amountUsd,
+          marketCap: mcap,
+          timestamp: Date.now()
+        }, ...h]);
+
+        // SUBSCRIBE TO WEBSOCKET FOR UPDATES
+        this.marketService.subscribeToMint(data.baseToken.address);
+        return;
+      }
+
+      // Fallback for fresh Pump.fun tokens that DexScreener hasn't indexed yet.
+      const pump = await this.marketService.getPumpTraderToken(cleanMint);
+      if (!pump) {
+        this.error.set("Token not found yet (try again in a bit).");
         this.isLoading.set(false);
         return;
       }
 
-      const price = parseFloat(data.priceUsd);
-      const mcap = data.fdv || 0;
-      const tokensReceived = amountUsd / price;
-      
+      const quote = await this.marketService.getBestQuoteUsd(pump.mint);
+      if (!quote) {
+        this.error.set("Token price unavailable yet.");
+        this.isLoading.set(false);
+        return;
+      }
+
+      const tokensReceived = amountUsd / quote.priceUsd;
       const newPosition: Position = {
         id: crypto.randomUUID(),
-        mint: data.baseToken.address,
-        symbol: data.baseToken.symbol,
-        name: data.baseToken.name,
-        // Use seeded image generator if no image is returned, ensuring uniqueness per token
-        imageUrl: data.info?.imageUrl || `https://picsum.photos/seed/${data.baseToken.address}/200`,
-        entryPrice: price,
-        currentPrice: price,
+        mint: pump.mint,
+        symbol: pump.symbol || 'TOKEN',
+        name: pump.name || pump.symbol || pump.mint,
+        imageUrl: pump.image_uri || `https://picsum.photos/seed/${pump.mint}/200`,
+        entryPrice: quote.priceUsd,
+        currentPrice: quote.priceUsd,
         amountTokens: tokensReceived,
         investedAmount: amountUsd,
-        entryMcap: mcap,
-        currentMcap: mcap,
+        entryMcap: quote.mcapUsd,
+        currentMcap: quote.mcapUsd,
         timestamp: Date.now()
       };
 
@@ -189,14 +242,14 @@ export class PortfolioService {
       this.history.update(h => [{
         id: crypto.randomUUID(),
         type: 'BUY',
-        symbol: data.baseToken.symbol,
+        symbol: newPosition.symbol,
         amountUsd: amountUsd,
-        marketCap: mcap,
+        marketCap: quote.mcapUsd,
         timestamp: Date.now()
       }, ...h]);
 
       // SUBSCRIBE TO WEBSOCKET FOR UPDATES
-      this.marketService.subscribeToMint(data.baseToken.address);
+      this.marketService.subscribeToMint(newPosition.mint);
 
     } catch (e) {
       this.error.set("Failed to execute buy.");
@@ -210,11 +263,13 @@ export class PortfolioService {
     if (!pos) return;
 
     this.isLoading.set(true);
+    this.error.set(null);
 
     try {
-      // Use current price from signal (which is updated via WS) for execution
-      const executionPrice = pos.currentPrice;
-      const executionMcap = pos.currentMcap;
+      // Sell using the latest available valuation (DexScreener first, then PumpTrader).
+      const latest = await this.marketService.getBestQuoteUsd(pos.mint);
+      const executionPrice = latest?.priceUsd ?? pos.currentPrice;
+      const executionMcap = latest?.mcapUsd ?? pos.currentMcap;
 
       const sellValue = pos.amountTokens * executionPrice;
       const pnl = sellValue - pos.investedAmount;
@@ -239,6 +294,44 @@ export class PortfolioService {
       this.error.set("Failed to execute sell.");
     } finally {
       this.isLoading.set(false);
+    }
+  }
+
+  async refreshPosition(positionId: string) {
+    if (this.isLoading()) return;
+    if (this.refreshingPositionId()) return;
+
+    const pos = this.positions().find(p => p.id === positionId);
+    if (!pos) return;
+
+    this.refreshingPositionId.set(positionId);
+    this.error.set(null);
+
+    try {
+      const quote = await this.marketService.getBestQuoteUsd(pos.mint);
+      if (!quote) {
+        this.error.set('Token not indexed yet. Try again in a bit.');
+        return;
+      }
+
+      const nextPrice = quote.priceUsd;
+      const nextMcap = quote.mcapUsd;
+
+      this.positions.update(currentPositions =>
+        currentPositions.map(p =>
+          p.id === positionId
+            ? {
+                ...p,
+                currentPrice: nextPrice,
+                currentMcap: Number.isFinite(nextMcap) && nextMcap > 0 ? nextMcap : p.currentMcap
+              }
+            : p
+        )
+      );
+    } catch (e) {
+      this.error.set('Failed to refresh token data.');
+    } finally {
+      this.refreshingPositionId.set(null);
     }
   }
 

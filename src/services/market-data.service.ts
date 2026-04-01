@@ -39,13 +39,30 @@ export interface PumpPortalTrade {
   marketCapSol: number;
 }
 
+export interface PumpTraderToken {
+  mint: string;
+  name?: string;
+  symbol?: string;
+  description?: string;
+  image_uri?: string;
+  twitter?: string;
+  telegram?: string;
+  website?: string;
+  market_cap?: number; // Usually in SOL
+  usd_market_cap?: number;
+  virtual_sol_reserves?: number;
+  virtual_token_reserves?: number;
+  total_supply?: number;
+}
+
 @Injectable({
   providedIn: 'root'
 })
 export class MarketDataService {
   
   // SOL Price for conversions (PumpPortal gives data in SOL)
-  private solPriceUsd = 0;
+  // Default to a reasonable value so live updates still work if the HTTP fetch is blocked/rate-limited.
+  private solPriceUsd = 150;
   
   // WebSocket State
   private socket$: WebSocketSubject<any> | null = null;
@@ -66,16 +83,17 @@ export class MarketDataService {
     try {
       // Fetch SOL price from DexScreener (using Wrapped SOL address)
       const response = await fetch('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112');
-      if (response.ok) {
-        const data = await response.json();
-        if (data.pairs && data.pairs.length > 0) {
-          this.solPriceUsd = parseFloat(data.pairs[0].priceUsd);
-          // console.log('SOL Price updated:', this.solPriceUsd);
-        }
-      }
+      if (!response.ok) throw new Error(`SOL price HTTP ${response.status}`);
+
+      const data = await response.json();
+      const next = parseFloat(data?.pairs?.[0]?.priceUsd);
+      if (!Number.isFinite(next) || next <= 0) throw new Error('Invalid SOL price payload');
+
+      this.solPriceUsd = next;
     } catch (e) {
       console.warn('Failed to fetch SOL price, defaulting to 150', e);
-      if (this.solPriceUsd === 0) this.solPriceUsd = 150; // Fallback only if never set
+      // Keep existing value if already set; otherwise use fallback.
+      if (!Number.isFinite(this.solPriceUsd) || this.solPriceUsd <= 0) this.solPriceUsd = 150;
     }
   }
 
@@ -97,6 +115,57 @@ export class MarketDataService {
       console.warn('Error fetching token data:', error);
       return null;
     }
+  }
+
+  async getPumpTraderToken(mintAddress: string): Promise<PumpTraderToken | null> {
+    if (!mintAddress || mintAddress.length < 10) return null;
+
+    try {
+      const response = await fetch(`https://pumptrader.fun/tokens/${mintAddress}`);
+      if (!response.ok) return null;
+
+      const data = await response.json();
+      const token = data?.token as PumpTraderToken | undefined;
+      if (!token || typeof token.mint !== 'string') return null;
+      return token;
+    } catch (error) {
+      console.warn('Error fetching PumpTrader token data:', error);
+      return null;
+    }
+  }
+
+  private toNumber(val: unknown): number | null {
+    const n = typeof val === 'number' ? val : typeof val === 'string' ? Number(val) : NaN;
+    if (!Number.isFinite(n)) return null;
+    return n;
+  }
+
+  // Single helper used by manual updates and sell execution:
+  // DexScreener first (best for graduated tokens), then PumpTrader (best for fresh Pump.fun tokens).
+  async getBestQuoteUsd(mintAddress: string): Promise<{ priceUsd: number; mcapUsd: number } | null> {
+    const ds = await this.getTokenData(mintAddress);
+    const dsPrice = this.toNumber(ds?.priceUsd);
+    if (ds && dsPrice && dsPrice > 0) {
+      const dsMcap =
+        typeof ds.fdv === 'number' && Number.isFinite(ds.fdv) && ds.fdv > 0 ? ds.fdv : dsPrice * 1_000_000_000;
+      return { priceUsd: dsPrice, mcapUsd: dsMcap };
+    }
+
+    const pump = await this.getPumpTraderToken(mintAddress);
+    const mcapUsd = this.toNumber(pump?.usd_market_cap);
+    if (mcapUsd && mcapUsd > 0) {
+      return { priceUsd: mcapUsd / 1_000_000_000, mcapUsd };
+    }
+
+    const mcapSol = this.toNumber(pump?.market_cap);
+    if (mcapSol && mcapSol > 0) {
+      const mcapUsdFromSol = mcapSol * (this.solPriceUsd || 0);
+      if (Number.isFinite(mcapUsdFromSol) && mcapUsdFromSol > 0) {
+        return { priceUsd: mcapUsdFromSol / 1_000_000_000, mcapUsd: mcapUsdFromSol };
+      }
+    }
+
+    return null;
   }
 
   // --- WebSocket Logic (Real-time) ---

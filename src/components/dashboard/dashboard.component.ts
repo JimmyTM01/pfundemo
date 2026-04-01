@@ -179,6 +179,11 @@ import { StatCardComponent } from '../ui/stat-card.component';
 
               <!-- Action -->
               <div class="flex flex-col gap-2 items-end md:min-w-[120px]">
+                 <button (click)="portfolio.refreshPosition(pos.id)"
+                    [disabled]="portfolio.isLoading() || portfolio.refreshingPositionId() === pos.id"
+                    class="w-full bg-slate-500/10 hover:bg-slate-500/20 text-slate-300 border border-slate-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">
+                   {{ portfolio.refreshingPositionId() === pos.id ? 'UPDATING...' : 'UPDATE' }}
+                 </button>
                  <button (click)="portfolio.sellPosition(pos.id)" 
                     [disabled]="portfolio.isLoading()"
                     class="w-full bg-red-500/10 hover:bg-red-500 hover:text-white text-red-400 border border-red-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">
