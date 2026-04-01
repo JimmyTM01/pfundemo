@@ -2,7 +2,7 @@ import { Injectable, signal, computed, inject, effect, untracked } from '@angula
 import { MarketDataService, TokenData } from './market-data.service';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { interval } from 'rxjs';
-import { switchMap, tap } from 'rxjs/operators';
+import { tap } from 'rxjs/operators';
 
 export interface Position {
   id: string;
@@ -45,35 +45,28 @@ export class PortfolioService {
   readonly error = signal<string | null>(null);
 
   constructor() {
-    // 1. Load saved state immediately on startup
     this.loadState();
 
-    // 2. Listen for real-time trade updates (Global Polling + WebSocket)
+    // 1. Unified Trade Stream (WebSocket + Official Fast Poll)
     this.marketService.tradeUpdates$
       .pipe(takeUntilDestroyed())
-      .subscribe(trade => {
-        this.updatePositionFromTrade(trade);
-      });
+      .subscribe(trade => this.updatePositionFromTrade(trade));
 
-    // 3. Official Pump.fun API Polling for Bag Consistency
-    // This handles cases where the global feed might miss a trade for a specific token
-    interval(5000).pipe(
+    // 2. Focused Official Polling (Consistency check for Bag)
+    // Runs every 3s for any positions that haven't been updated in 5s
+    interval(3000).pipe(
       takeUntilDestroyed(),
       tap(() => {
-        const currentPositions = this.positions();
-        if (currentPositions.length > 0) {
-          // Only poll specifically for tokens that haven't been updated in 5 seconds
-          const now = Date.now();
-          currentPositions.forEach(pos => {
-            if (!pos.lastUpdate || (now - pos.lastUpdate) > 5000) {
-              this.refreshPositionFromOfficialApi(pos);
-            }
-          });
-        }
+        const now = Date.now();
+        this.positions().forEach(pos => {
+          if (!pos.lastUpdate || (now - pos.lastUpdate) > 5000) {
+            this.refreshPositionFromOfficialApi(pos);
+          }
+        });
       })
     ).subscribe();
 
-    // 4. Auto-save state
+    // 3. Persistent Storage
     effect(() => {
       const state = {
         cashBalance: this.cashBalance(),
@@ -83,15 +76,12 @@ export class PortfolioService {
       localStorage.setItem(this.STORAGE_KEY, JSON.stringify(state));
     });
 
-    // 5. WebSocket Reconnection Recovery
+    // 4. WebSocket Recovery
     effect(() => {
       if (this.marketService.isConnected()) {
         untracked(() => {
-          const currentPositions = this.positions();
           this.marketService.subscribeAllTokenTrades();
-          if (currentPositions.length > 0) {
-            currentPositions.forEach(p => this.marketService.subscribeToMint(p.mint));
-          }
+          this.positions().forEach(p => this.marketService.subscribeToMint(p.mint));
         });
       }
     });
@@ -102,14 +92,12 @@ export class PortfolioService {
       const data = await this.marketService.getPumpTokenData(pos.mint);
       if (data) {
         const priceUsd = parseFloat(data.priceUsd);
-        const mcapUsd = data.fdv || 0;
-
         if (priceUsd > 0) {
           this.positions.update(current =>
             current.map(p => p.mint === pos.mint ? {
               ...p,
               currentPrice: priceUsd,
-              currentMcap: mcapUsd,
+              currentMcap: data.fdv || 0,
               lastUpdate: Date.now()
             } : p)
           );
@@ -139,11 +127,9 @@ export class PortfolioService {
     if (saved) {
       try {
         const state = JSON.parse(saved);
-        this.cashBalance.set(state.cashBalance);
+        this.cashBalance.set(state.cashBalance || 100);
         this.history.set(state.history || []);
-        
-        const savedPositions: Position[] = state.positions || [];
-        this.positions.set(savedPositions);
+        this.positions.set(state.positions || []);
       } catch (e) {
         console.error('Failed to parse saved state', e);
       }
@@ -154,9 +140,8 @@ export class PortfolioService {
     const mint = trade.mint;
     if (!mint) return;
 
-    // Check if we have this position
-    const posIndex = this.positions().findIndex(p => p.mint === mint);
-    if (posIndex === -1) return;
+    const hasPosition = this.positions().some(p => p.mint === mint);
+    if (!hasPosition) return;
 
     const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(trade.marketCapSol);
     
@@ -165,8 +150,6 @@ export class PortfolioService {
     this.positions.update(currentPositions => {
       return currentPositions.map(pos => {
         if (pos.mint === mint) {
-          // Only update if it's a newer price or we haven't updated in a while
-          // This avoids flickering if multiple sources report the same trade
           return {
             ...pos,
             currentPrice: priceUsd,
@@ -203,6 +186,7 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
+      // Always prioritize pump.fun official data for buying
       const data = await this.marketService.getPumpTokenData(cleanMint) || await this.marketService.getTokenData(cleanMint);
       
       if (!data) {

@@ -1,7 +1,8 @@
-import { Injectable, signal } from '@angular/core';
+import { Injectable, signal, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
 import { webSocket, WebSocketSubject } from 'rxjs/webSocket';
-import { filter, retry } from 'rxjs/operators';
-import { Subject, interval } from 'rxjs';
+import { filter, retry, catchError } from 'rxjs/operators';
+import { Subject, interval, of, firstValueFrom } from 'rxjs';
 
 export interface TokenData {
   isPump?: boolean;
@@ -44,36 +45,38 @@ export interface PumpPortalTrade {
   providedIn: 'root'
 })
 export class MarketDataService {
+  private http = inject(HttpClient);
   
-  // SOL Price for conversions (PumpPortal gives data in SOL)
+  // SOL Price for conversions
   private solPriceUsd = 200;
   
-  // WebSocket State
-  private socket$: WebSocketSubject<any> | null = null;
-  public readonly tradeUpdates$ = new Subject<PumpPortalTrade>();
+  // Status signals
   public readonly isConnected = signal<boolean>(false);
   public readonly isPollingActive = signal<boolean>(false);
+
+  // Real-time events
+  private socket$: WebSocketSubject<any> | null = null;
+  public readonly tradeUpdates$ = new Subject<PumpPortalTrade>();
 
   constructor() {
     this.fetchSolPrice();
     this.connectWebSocket();
     this.startGlobalTradePolling();
+
+    // Refresh SOL price every 60s
     interval(60000).subscribe(() => this.fetchSolPrice());
   }
 
-  // --- Initial Data Fetching (HTTP) ---
+  // --- Initial Data Fetching ---
 
   async fetchSolPrice() {
     try {
-      const response = await fetch('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112');
-      if (response.ok) {
-        const data = await response.json();
-        if (data.pairs && data.pairs.length > 0) {
-          const price = parseFloat(data.pairs[0].priceUsd);
-          if (price > 0) {
-            this.solPriceUsd = price;
-          }
-        }
+      const data: any = await firstValueFrom(
+        this.http.get('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112')
+      );
+      if (data?.pairs?.[0]?.priceUsd) {
+        const price = parseFloat(data.pairs[0].priceUsd);
+        if (price > 0) this.solPriceUsd = price;
       }
     } catch (e) {
       console.warn('Failed to fetch SOL price, using fallback', e);
@@ -82,9 +85,11 @@ export class MarketDataService {
 
   async getPumpTokenData(mintAddress: string): Promise<TokenData | null> {
     try {
-      const response = await fetch(`https://frontend-api.pump.fun/coins/${mintAddress}`);
-      if (!response.ok) return null;
-      const data = await response.json();
+      const data: any = await firstValueFrom(
+        this.http.get(`https://frontend-api.pump.fun/coins/${mintAddress}`)
+      );
+
+      if (!data || !data.mint) return null;
 
       const mcapUsd = parseFloat(data.usd_market_cap) || 0;
       const priceUsd = mcapUsd / 1_000_000_000;
@@ -115,15 +120,16 @@ export class MarketDataService {
   async getTokenData(mintAddress: string): Promise<TokenData | null> {
     if (!mintAddress || mintAddress.length < 10) return null;
 
+    // Prioritize official pump.fun data for accuracy and immediate availability
     const pumpData = await this.getPumpTokenData(mintAddress);
     if (pumpData) return pumpData;
 
     try {
-      const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`);
-      if (!response.ok) return null;
+      const data: any = await firstValueFrom(
+        this.http.get(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`)
+      );
 
-      const data = await response.json();
-      if (!data.pairs || data.pairs.length === 0) return null;
+      if (!data?.pairs?.length) return null;
 
       const sortedPairs = data.pairs.sort((a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
       return sortedPairs[0] as TokenData;
@@ -133,20 +139,21 @@ export class MarketDataService {
     }
   }
 
-  // --- Official API Global Polling ---
+  // --- Official Global Trade Polling ---
 
   private startGlobalTradePolling() {
-    // Poll all latest trades from official pump.fun API
-    interval(1500).subscribe(async () => {
+    interval(1500).pipe(
+      catchError(() => of([]))
+    ).subscribe(async () => {
       try {
-        const response = await fetch('https://frontend-api.pump.fun/trades/all?limit=50');
-        if (response.ok) {
-          const trades = await response.json();
-          this.isPollingActive.set(true);
+        const trades: any = await firstValueFrom(
+          this.http.get('https://frontend-api.pump.fun/trades/all?limit=50')
+        );
 
+        if (Array.isArray(trades)) {
+          this.isPollingActive.set(true);
           trades.forEach((t: any) => {
-            // Map official trade to our PumpPortalTrade format for consistency
-            const mappedTrade: PumpPortalTrade = {
+            this.tradeUpdates$.next({
               signature: t.signature,
               mint: t.mint,
               traderPublicKey: t.user,
@@ -157,9 +164,8 @@ export class MarketDataService {
               bondingCurveKey: '',
               vTokensInBondingCurve: 0,
               vSolInBondingCurve: 0,
-              marketCapSol: parseFloat(t.market_cap) / 1e9 // Assuming market_cap is in lamports
-            };
-            this.tradeUpdates$.next(mappedTrade);
+              marketCapSol: parseFloat(t.market_cap) / 1e9
+            });
           });
         }
       } catch (e) {
@@ -169,7 +175,7 @@ export class MarketDataService {
     });
   }
 
-  // --- WebSocket Logic (Real-time fallback/speed) ---
+  // --- Real-time WebSocket ---
 
   private connectWebSocket() {
     if (this.socket$) return;
