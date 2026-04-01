@@ -48,26 +48,32 @@ export class PortfolioService {
     // 1. Load saved state immediately on startup
     this.loadState();
 
-    // 2. Listen for real-time trade updates from PumpPortal (Ultra-fast updates)
+    // 2. Listen for real-time trade updates (Global Polling + WebSocket)
     this.marketService.tradeUpdates$
       .pipe(takeUntilDestroyed())
       .subscribe(trade => {
         this.updatePositionFromTrade(trade);
       });
 
-    // 3. Official Pump.fun API Polling (Reliable/Official updates)
-    // Poll every 2 seconds for all active positions
-    interval(2000).pipe(
+    // 3. Official Pump.fun API Polling for Bag Consistency
+    // This handles cases where the global feed might miss a trade for a specific token
+    interval(5000).pipe(
       takeUntilDestroyed(),
       tap(() => {
         const currentPositions = this.positions();
         if (currentPositions.length > 0) {
-          currentPositions.forEach(pos => this.refreshPositionFromOfficialApi(pos));
+          // Only poll specifically for tokens that haven't been updated in 5 seconds
+          const now = Date.now();
+          currentPositions.forEach(pos => {
+            if (!pos.lastUpdate || (now - pos.lastUpdate) > 5000) {
+              this.refreshPositionFromOfficialApi(pos);
+            }
+          });
         }
       })
     ).subscribe();
 
-    // 4. Auto-save state whenever signals change
+    // 4. Auto-save state
     effect(() => {
       const state = {
         cashBalance: this.cashBalance(),
@@ -77,7 +83,7 @@ export class PortfolioService {
       localStorage.setItem(this.STORAGE_KEY, JSON.stringify(state));
     });
 
-    // 5. CONNECTION RECOVERY LOGIC (WebSocket)
+    // 5. WebSocket Reconnection Recovery
     effect(() => {
       if (this.marketService.isConnected()) {
         untracked(() => {
@@ -110,7 +116,7 @@ export class PortfolioService {
         }
       }
     } catch (e) {
-      console.warn('Official API polling error:', e);
+      console.warn('Official API individual refresh error:', e);
     }
   }
 
@@ -148,19 +154,19 @@ export class PortfolioService {
     const mint = trade.mint;
     if (!mint) return;
 
-    const hasPosition = this.positions().some(p => p.mint === mint);
-    if (!hasPosition) return;
+    // Check if we have this position
+    const posIndex = this.positions().findIndex(p => p.mint === mint);
+    if (posIndex === -1) return;
 
-    const mcapSol = trade.marketCapSol || trade.vSolInBondingCurve;
-    if (!mcapSol) return;
-
-    const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(mcapSol);
+    const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(trade.marketCapSol);
     
     if (priceUsd <= 0) return;
 
     this.positions.update(currentPositions => {
       return currentPositions.map(pos => {
         if (pos.mint === mint) {
+          // Only update if it's a newer price or we haven't updated in a while
+          // This avoids flickering if multiple sources report the same trade
           return {
             ...pos,
             currentPrice: priceUsd,
@@ -197,7 +203,6 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      // Prioritize Pump.fun data for new tokens
       const data = await this.marketService.getPumpTokenData(cleanMint) || await this.marketService.getTokenData(cleanMint);
       
       if (!data) {

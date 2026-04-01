@@ -105,12 +105,12 @@ import { StatCardComponent } from '../ui/stat-card.component';
           <div class="flex items-center gap-2 bg-slate-800/50 px-2 md:px-3 py-1 md:py-1.5 rounded-full border border-white/5">
              <div class="relative flex h-1.5 w-1.5 md:h-2 md:w-2">
                 <span class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75" 
-                      [class]="marketService.isConnected() ? 'bg-green-400' : 'bg-red-400'"></span>
+                      [class]="isLive() ? 'bg-green-400' : 'bg-red-400'"></span>
                 <span class="relative inline-flex rounded-full h-1.5 w-1.5 md:h-2 md:w-2"
-                      [class]="marketService.isConnected() ? 'bg-green-500' : 'bg-red-500'"></span>
+                      [class]="isLive() ? 'bg-green-500' : 'bg-red-500'"></span>
              </div>
-             <span class="text-[10px] md:text-xs font-mono font-bold" [class]="marketService.isConnected() ? 'text-green-400' : 'text-red-400'">
-               {{ marketService.isConnected() ? 'LIVE FEED' : 'CONNECTING...' }}
+             <span class="text-[10px] md:text-xs font-mono font-bold" [class]="isLive() ? 'text-green-400' : 'text-red-400'">
+               {{ isLive() ? 'LIVE FEED' : 'CONNECTING...' }}
              </span>
           </div>
         </div>
@@ -256,6 +256,10 @@ export class DashboardComponent {
   }
 
   // Helpers
+  isLive(): boolean {
+    return this.marketService.isConnected() || this.marketService.isPollingActive();
+  }
+
   getPnl(pos: Position): number {
     return (pos.currentPrice * pos.amountTokens) - pos.investedAmount;
   }

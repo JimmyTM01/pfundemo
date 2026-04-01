@@ -52,10 +52,12 @@ export class MarketDataService {
   private socket$: WebSocketSubject<any> | null = null;
   public readonly tradeUpdates$ = new Subject<PumpPortalTrade>();
   public readonly isConnected = signal<boolean>(false);
+  public readonly isPollingActive = signal<boolean>(false);
 
   constructor() {
     this.fetchSolPrice();
     this.connectWebSocket();
+    this.startGlobalTradePolling();
     interval(60000).subscribe(() => this.fetchSolPrice());
   }
 
@@ -84,8 +86,6 @@ export class MarketDataService {
       if (!response.ok) return null;
       const data = await response.json();
 
-      // Calculate real price from official data
-      // usd_market_cap / 1B token supply
       const mcapUsd = parseFloat(data.usd_market_cap) || 0;
       const priceUsd = mcapUsd / 1_000_000_000;
 
@@ -115,7 +115,6 @@ export class MarketDataService {
   async getTokenData(mintAddress: string): Promise<TokenData | null> {
     if (!mintAddress || mintAddress.length < 10) return null;
 
-    // Always try Pump.fun first to ensure official data for newly bought tokens
     const pumpData = await this.getPumpTokenData(mintAddress);
     if (pumpData) return pumpData;
 
@@ -134,7 +133,43 @@ export class MarketDataService {
     }
   }
 
-  // --- WebSocket Logic (Real-time) ---
+  // --- Official API Global Polling ---
+
+  private startGlobalTradePolling() {
+    // Poll all latest trades from official pump.fun API
+    interval(1500).subscribe(async () => {
+      try {
+        const response = await fetch('https://frontend-api.pump.fun/trades/all?limit=50');
+        if (response.ok) {
+          const trades = await response.json();
+          this.isPollingActive.set(true);
+
+          trades.forEach((t: any) => {
+            // Map official trade to our PumpPortalTrade format for consistency
+            const mappedTrade: PumpPortalTrade = {
+              signature: t.signature,
+              mint: t.mint,
+              traderPublicKey: t.user,
+              txType: t.is_buy ? 'buy' : 'sell',
+              tokenAmount: parseFloat(t.token_amount),
+              solAmount: parseFloat(t.sol_amount) / 1e9,
+              newTokenBalance: 0,
+              bondingCurveKey: '',
+              vTokensInBondingCurve: 0,
+              vSolInBondingCurve: 0,
+              marketCapSol: parseFloat(t.market_cap) / 1e9 // Assuming market_cap is in lamports
+            };
+            this.tradeUpdates$.next(mappedTrade);
+          });
+        }
+      } catch (e) {
+        console.warn('Global trade polling error:', e);
+        this.isPollingActive.set(false);
+      }
+    });
+  }
+
+  // --- WebSocket Logic (Real-time fallback/speed) ---
 
   private connectWebSocket() {
     if (this.socket$) return;
@@ -162,7 +197,10 @@ export class MarketDataService {
       filter(msg => msg && msg.mint)
     ).subscribe({
       next: (msg: PumpPortalTrade) => this.tradeUpdates$.next(msg),
-      error: (err) => console.error('WS Error:', err)
+      error: (err) => {
+        console.error('WS Error:', err);
+        this.isConnected.set(false);
+      }
     });
   }
 
