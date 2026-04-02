@@ -1,6 +1,5 @@
-import { Injectable, signal, computed, inject, effect, untracked } from '@angular/core';
+import { Injectable, signal, computed, inject, effect } from '@angular/core';
 import { MarketDataService } from './market-data.service';
-import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 
 export interface Position {
   id: string;
@@ -43,17 +42,8 @@ export class PortfolioService {
   readonly error = signal<string | null>(null);
 
   constructor() {
-    // 1. Load saved state immediately on startup
     this.loadState();
 
-    // 2. Listen for real-time trade updates from PumpPortal
-    this.marketService.tradeUpdates$
-      .pipe(takeUntilDestroyed())
-      .subscribe(trade => {
-        this.updatePositionFromTrade(trade);
-      });
-
-    // 3. Auto-save state whenever signals change
     effect(() => {
       const state = {
         cashBalance: this.cashBalance(),
@@ -61,20 +51,6 @@ export class PortfolioService {
         history: this.history()
       };
       localStorage.setItem(this.STORAGE_KEY, JSON.stringify(state));
-    });
-
-    // 4. CONNECTION RECOVERY LOGIC (Crucial for live updates)
-    // Whenever the socket connects (initially or after drop), re-subscribe to all held positions.
-    effect(() => {
-      if (this.marketService.isConnected()) {
-        untracked(() => {
-          const currentPositions = this.positions();
-          if (currentPositions.length > 0) {
-            console.log(`Connection restored. Re-subscribing ${currentPositions.length} positions.`);
-            currentPositions.forEach(p => this.marketService.subscribeToMint(p.mint));
-          }
-        });
-      }
     });
   }
 
@@ -111,27 +87,6 @@ export class PortfolioService {
     }
   }
 
-  private updatePositionFromTrade(trade: any) {
-    const { priceUsd, mcapUsd } = this.marketService.convertSolMcapToUsd(trade.marketCapSol);
-    
-    // Only update if we have a valid price (SOL price might be missing initially)
-    if (!Number.isFinite(priceUsd) || priceUsd <= 0) return;
-    if (!Number.isFinite(mcapUsd) || mcapUsd <= 0) return;
-
-    this.positions.update(currentPositions => {
-      return currentPositions.map(pos => {
-        if (pos.mint === trade.mint) {
-          return {
-            ...pos,
-            currentPrice: priceUsd,
-            currentMcap: mcapUsd
-          };
-        }
-        return pos;
-      });
-    });
-  }
-
   async buyToken(mintAddress: string, amountUsd: number) {
     if (amountUsd > this.cashBalance()) {
       this.error.set("Insufficient funds!");
@@ -157,36 +112,24 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      // Always execute buys on the latest available valuation (WS tick first, then HTTP fallbacks).
-      const quote = await this.marketService.getLatestQuoteUsd(cleanMint, { timeoutMs: 20000 });
-      if (!quote) {
+      const snapshot = await this.marketService.getTokenSnapshot(cleanMint);
+      if (!snapshot) {
         this.error.set("Unable to fetch current token price. Try again.");
         return;
       }
-
-      // Fetch metadata separately (symbol/name/image). This may be missing for very new tokens.
-      const data = await this.marketService.getTokenData(cleanMint);
-      const pump = data ? null : await this.marketService.getPumpTraderToken(cleanMint);
-
-      const mint = data?.baseToken?.address || pump?.mint || cleanMint;
-      const symbol = data?.baseToken?.symbol || pump?.symbol || 'TOKEN';
-      const name = data?.baseToken?.name || pump?.name || symbol;
-      const imageUrl =
-        data?.info?.imageUrl || pump?.image_uri || `https://picsum.photos/seed/${mint}/200`;
-
-      const tokensReceived = amountUsd / quote.priceUsd;
+      const tokensReceived = amountUsd / snapshot.quote.priceUsd;
       const newPosition: Position = {
         id: crypto.randomUUID(),
-        mint,
-        symbol,
-        name,
-        imageUrl,
-        entryPrice: quote.priceUsd,
-        currentPrice: quote.priceUsd,
+        mint: snapshot.mint,
+        symbol: snapshot.symbol,
+        name: snapshot.name,
+        imageUrl: snapshot.imageUrl,
+        entryPrice: snapshot.quote.priceUsd,
+        currentPrice: snapshot.quote.priceUsd,
         amountTokens: tokensReceived,
         investedAmount: amountUsd,
-        entryMcap: quote.mcapUsd,
-        currentMcap: quote.mcapUsd,
+        entryMcap: snapshot.quote.mcapUsd,
+        currentMcap: snapshot.quote.mcapUsd,
         timestamp: Date.now()
       };
 
@@ -195,14 +138,11 @@ export class PortfolioService {
       this.history.update(h => [{
         id: crypto.randomUUID(),
         type: 'BUY',
-        symbol,
+        symbol: snapshot.symbol,
         amountUsd: amountUsd,
-        marketCap: quote.mcapUsd,
+        marketCap: snapshot.quote.mcapUsd,
         timestamp: Date.now()
       }, ...h]);
-
-      // SUBSCRIBE TO WEBSOCKET FOR UPDATES
-      this.marketService.subscribeToMint(mint);
 
     } catch (e) {
       this.error.set("Failed to execute buy.");
@@ -219,8 +159,7 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      // Always execute sells on the latest available valuation (WS tick first, then HTTP fallbacks).
-      const latest = await this.marketService.getLatestQuoteUsd(pos.mint, { timeoutMs: 20000 });
+      const latest = await this.marketService.getLatestQuoteUsd(pos.mint);
       if (!latest) {
         this.error.set("Unable to fetch current token price. Try again.");
         return;
@@ -244,9 +183,6 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
-      // UNSUBSCRIBE FROM WEBSOCKET
-      this.marketService.unsubscribeFromMint(pos.mint);
-
     } catch (e) {
       this.error.set("Failed to execute sell.");
     } finally {
@@ -265,7 +201,7 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      const quote = await this.marketService.getLatestQuoteUsd(pos.mint, { timeoutMs: 20000 });
+      const quote = await this.marketService.getLatestQuoteUsd(pos.mint);
       if (!quote) {
         this.error.set('Unable to fetch current token price. Try again.');
         return;
@@ -293,11 +229,6 @@ export class PortfolioService {
   }
 
   reset() {
-    // Unsubscribe all
-    this.positions().forEach(p => {
-      this.marketService.unsubscribeFromMint(p.mint);
-    });
-
     this.cashBalance.set(100);
     this.positions.set([]);
     this.history.set([]);

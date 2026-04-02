@@ -1,7 +1,5 @@
-import { Injectable, signal } from '@angular/core';
-import { webSocket, WebSocketSubject } from 'rxjs/webSocket';
-import { filter, retry } from 'rxjs/operators';
-import { Subject, interval } from 'rxjs';
+import { Injectable } from '@angular/core';
+import { interval } from 'rxjs';
 
 export interface TokenData {
   chainId: string;
@@ -25,20 +23,6 @@ export interface TokenData {
   };
 }
 
-export interface PumpPortalTrade {
-  signature: string;
-  mint: string;
-  traderPublicKey: string;
-  txType: 'buy' | 'sell' | 'create';
-  tokenAmount: number;
-  solAmount: number;
-  newTokenBalance: number;
-  bondingCurveKey: string;
-  vTokensInBondingCurve: number;
-  vSolInBondingCurve: number;
-  marketCapSol: number;
-}
-
 export interface PumpTraderToken {
   mint: string;
   name?: string;
@@ -59,23 +43,11 @@ export interface PumpTraderToken {
   providedIn: 'root'
 })
 export class MarketDataService {
-  
-  // SOL Price for conversions (PumpPortal gives data in SOL)
-  // Default to a reasonable value so live updates still work if the HTTP fetch is blocked/rate-limited.
+  // SOL price is only needed when PumpTrader gives market cap in SOL instead of USD.
   private solPriceUsd = 150;
-  private lastTradeByMint = new Map<string, PumpPortalTrade>();
-  private lastTradeAtByMint = new Map<string, number>();
-  
-  // WebSocket State
-  private socket$: WebSocketSubject<any> | null = null;
-  public readonly tradeUpdates$ = new Subject<PumpPortalTrade>();
-  public readonly isConnected = signal<boolean>(false);
 
   constructor() {
     this.fetchSolPrice();
-    this.connectWebSocket();
-    
-    // Refresh SOL price every 60 seconds to keep USD valuations accurate
     interval(60000).subscribe(() => this.fetchSolPrice());
   }
 
@@ -148,184 +120,76 @@ export class MarketDataService {
     return n;
   }
 
-  // Single helper used by manual updates and sell execution:
-  // DexScreener first (best for graduated tokens), then PumpTrader (best for fresh Pump.fun tokens).
-  async getBestQuoteUsd(mintAddress: string): Promise<{ priceUsd: number; mcapUsd: number } | null> {
-    const ds = await this.getTokenData(mintAddress);
-    const dsPrice = this.toNumber(ds?.priceUsd);
-    if (ds && dsPrice && dsPrice > 0) {
-      const dsMcap =
-        typeof ds.fdv === 'number' && Number.isFinite(ds.fdv) && ds.fdv > 0 ? ds.fdv : dsPrice * 1_000_000_000;
-      return { priceUsd: dsPrice, mcapUsd: dsMcap };
-    }
+  private getDexQuoteUsd(token: TokenData | null): { priceUsd: number; mcapUsd: number } | null {
+    const priceUsd = this.toNumber(token?.priceUsd);
+    if (!priceUsd || priceUsd <= 0) return null;
 
-    const pump = await this.getPumpTraderToken(mintAddress);
-    const mcapUsd = this.toNumber(pump?.usd_market_cap);
+    const mcapUsd =
+      typeof token?.fdv === 'number' && Number.isFinite(token.fdv) && token.fdv > 0
+        ? token.fdv
+        : priceUsd * 1_000_000_000;
+
+    if (!Number.isFinite(mcapUsd) || mcapUsd <= 0) return null;
+    return { priceUsd, mcapUsd };
+  }
+
+  private async getPumpQuoteUsd(token: PumpTraderToken | null): Promise<{ priceUsd: number; mcapUsd: number } | null> {
+    const mcapUsd = this.toNumber(token?.usd_market_cap);
     if (mcapUsd && mcapUsd > 0) {
       return { priceUsd: mcapUsd / 1_000_000_000, mcapUsd };
     }
 
-    const mcapSol = this.toNumber(pump?.market_cap);
-    if (mcapSol && mcapSol > 0) {
-      const mcapUsdFromSol = mcapSol * (this.solPriceUsd || 0);
-      if (Number.isFinite(mcapUsdFromSol) && mcapUsdFromSol > 0) {
-        return { priceUsd: mcapUsdFromSol / 1_000_000_000, mcapUsd: mcapUsdFromSol };
-      }
-    }
+    const mcapSol = this.toNumber(token?.market_cap);
+    if (!mcapSol || mcapSol <= 0) return null;
 
-    return null;
+    await this.fetchSolPrice();
+    const mcapUsdFromSol = mcapSol * this.solPriceUsd;
+    if (!Number.isFinite(mcapUsdFromSol) || mcapUsdFromSol <= 0) return null;
+
+    return { priceUsd: mcapUsdFromSol / 1_000_000_000, mcapUsd: mcapUsdFromSol };
   }
 
-  private waitForConnected(timeoutMs: number): Promise<boolean> {
-    if (this.isConnected()) return Promise.resolve(true);
+  async getLatestQuoteUsd(mintAddress: string): Promise<{ priceUsd: number; mcapUsd: number } | null> {
+    const [dexToken, pumpToken] = await Promise.all([
+      this.getTokenData(mintAddress),
+      this.getPumpTraderToken(mintAddress)
+    ]);
 
-    return new Promise(resolve => {
-      const start = Date.now();
-      const timer = setInterval(() => {
-        if (this.isConnected()) {
-          clearInterval(timer);
-          resolve(true);
-          return;
-        }
-        if (Date.now() - start >= timeoutMs) {
-          clearInterval(timer);
-          resolve(false);
-        }
-      }, 200);
-    });
+    const [pumpQuote, dexQuote] = await Promise.all([
+      this.getPumpQuoteUsd(pumpToken),
+      Promise.resolve(this.getDexQuoteUsd(dexToken))
+    ]);
+
+    // Prefer PumpTrader for fresh Pump.fun tokens, then DexScreener for graduated pairs.
+    return pumpQuote ?? dexQuote;
   }
 
-  private waitForNextTrade(mint: string, timeoutMs: number): Promise<PumpPortalTrade | null> {
-    return new Promise(resolve => {
-      const sub = this.tradeUpdates$.subscribe(trade => {
-        if (trade?.mint === mint) {
-          cleanup();
-          resolve(trade);
-        }
-      });
-      const timer = setTimeout(() => {
-        cleanup();
-        resolve(null);
-      }, timeoutMs);
+  async getTokenSnapshot(mintAddress: string): Promise<{
+    mint: string;
+    symbol: string;
+    name: string;
+    imageUrl: string;
+    quote: { priceUsd: number; mcapUsd: number };
+  } | null> {
+    const [dexToken, pumpToken] = await Promise.all([
+      this.getTokenData(mintAddress),
+      this.getPumpTraderToken(mintAddress)
+    ]);
 
-      const cleanup = () => {
-        clearTimeout(timer);
-        sub.unsubscribe();
-      };
-    });
-  }
+    const [pumpQuote, dexQuote] = await Promise.all([
+      this.getPumpQuoteUsd(pumpToken),
+      Promise.resolve(this.getDexQuoteUsd(dexToken))
+    ]);
 
-  // "Current" valuation for actions: WS trade update first (freshest), then HTTP fallbacks.
-  // This intentionally bypasses browser caches and may wait a bit for a new trade tick.
-  async getLatestQuoteUsd(
-    mintAddress: string,
-    opts?: { timeoutMs?: number; maxAgeMs?: number; waitForConnectionMs?: number }
-  ): Promise<{ priceUsd: number; mcapUsd: number } | null> {
-    const timeoutMs = opts?.timeoutMs ?? 15000;
-    const maxAgeMs = opts?.maxAgeMs ?? 8000;
-    const waitForConnectionMs = opts?.waitForConnectionMs ?? 5000;
+    const quote = pumpQuote ?? dexQuote;
+    if (!quote) return null;
 
-    const lastTrade = this.lastTradeByMint.get(mintAddress);
-    const lastAt = this.lastTradeAtByMint.get(mintAddress);
-    if (lastTrade && typeof lastAt === 'number' && Date.now() - lastAt <= maxAgeMs) {
-      await this.fetchSolPrice();
-      const { priceUsd, mcapUsd } = this.convertSolMcapToUsd(lastTrade.marketCapSol);
-      if (Number.isFinite(priceUsd) && priceUsd > 0 && Number.isFinite(mcapUsd) && mcapUsd > 0) {
-        return { priceUsd, mcapUsd };
-      }
-    }
+    const mint = dexToken?.baseToken.address || pumpToken?.mint || mintAddress;
+    const symbol = dexToken?.baseToken.symbol || pumpToken?.symbol || 'TOKEN';
+    const name = dexToken?.baseToken.name || pumpToken?.name || symbol;
+    const imageUrl =
+      dexToken?.info?.imageUrl || pumpToken?.image_uri || `https://picsum.photos/seed/${mint}/200`;
 
-    const connected = this.isConnected() || (await this.waitForConnected(waitForConnectionMs));
-    if (connected) {
-      await this.fetchSolPrice();
-      this.subscribeToMint(mintAddress);
-
-      const trade = await this.waitForNextTrade(mintAddress, timeoutMs);
-      if (trade) {
-        const { priceUsd, mcapUsd } = this.convertSolMcapToUsd(trade.marketCapSol);
-        if (Number.isFinite(priceUsd) && priceUsd > 0 && Number.isFinite(mcapUsd) && mcapUsd > 0) {
-          return { priceUsd, mcapUsd };
-        }
-      }
-    }
-
-    const httpQuote = await this.getBestQuoteUsd(mintAddress);
-    if (httpQuote) return httpQuote;
-
-    // If all HTTP sources fail, fall back to the last WS trade we have (even if older).
-    if (lastTrade) {
-      await this.fetchSolPrice();
-      const { priceUsd, mcapUsd } = this.convertSolMcapToUsd(lastTrade.marketCapSol);
-      if (Number.isFinite(priceUsd) && priceUsd > 0 && Number.isFinite(mcapUsd) && mcapUsd > 0) {
-        return { priceUsd, mcapUsd };
-      }
-    }
-
-    return null;
-  }
-
-  // --- WebSocket Logic (Real-time) ---
-
-  private connectWebSocket() {
-    if (this.socket$) return;
-
-    this.socket$ = webSocket({
-      url: 'wss://pumpportal.fun/api/data',
-      openObserver: {
-        next: () => {
-          console.log('PumpPortal WS Connected');
-          this.isConnected.set(true);
-        }
-      },
-      closeObserver: {
-        next: () => {
-          console.log('PumpPortal WS Closed');
-          this.isConnected.set(false);
-          this.socket$ = null;
-          // Simple reconnect logic via timeout
-          setTimeout(() => this.connectWebSocket(), 3000);
-        }
-      }
-    });
-
-    this.socket$.pipe(
-      retry({ delay: 3000 }), // Retry connection if it fails
-      filter(msg => msg && msg.mint) // Only pass valid trade messages
-    ).subscribe({
-      next: (msg: PumpPortalTrade) => {
-        this.lastTradeByMint.set(msg.mint, msg);
-        this.lastTradeAtByMint.set(msg.mint, Date.now());
-        this.tradeUpdates$.next(msg);
-      },
-      error: (err) => console.error('WS Error:', err)
-    });
-  }
-
-  subscribeToMint(mint: string) {
-    if (this.socket$ && this.isConnected()) {
-      this.socket$.next({
-        method: "subscribeTokenTrade",
-        keys: [mint]
-      });
-    }
-    // Removed the recursive setTimeout logic here as it causes issues.
-    // Re-subscription is now handled reactively in PortfolioService.
-  }
-
-  unsubscribeFromMint(mint: string) {
-    if (this.socket$ && this.isConnected()) {
-      this.socket$.next({
-        method: "unsubscribeTokenTrade",
-        keys: [mint]
-      });
-    }
-  }
-
-  // Helper to convert SOL market cap to USD price
-  // Assumption: Standard Pump.fun token supply is 1 Billion
-  convertSolMcapToUsd(mcapSol: number): { priceUsd: number, mcapUsd: number } {
-    const mcapUsd = mcapSol * (this.solPriceUsd || 0);
-    const priceUsd = mcapUsd / 1_000_000_000; 
-    return { priceUsd, mcapUsd };
+    return { mint, symbol, name, imageUrl, quote };
   }
 }

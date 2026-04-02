@@ -4,7 +4,6 @@ import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule, FormBuilder, Validators } from '@angular/forms';
 import { debounceTime, filter } from 'rxjs/operators';
 import { PortfolioService, Position } from '../../services/portfolio.service';
-import { MarketDataService } from '../../services/market-data.service';
 import { StatCardComponent } from '../ui/stat-card.component';
 
 @Component({
@@ -103,14 +102,9 @@ import { StatCardComponent } from '../ui/stat-card.component';
           </h2>
 
           <div class="flex items-center gap-2 bg-slate-800/50 px-3 py-1.5 rounded-full border border-white/5">
-             <div class="relative flex h-2 w-2">
-                <span class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75" 
-                      [class]="marketService.isConnected() ? 'bg-green-400' : 'bg-red-400'"></span>
-                <span class="relative inline-flex rounded-full h-2 w-2"
-                      [class]="marketService.isConnected() ? 'bg-green-500' : 'bg-red-500'"></span>
-             </div>
-             <span class="text-xs font-mono font-bold" [class]="marketService.isConnected() ? 'text-green-400' : 'text-red-400'">
-               {{ marketService.isConnected() ? 'LIVE FEED' : 'CONNECTING...' }}
+             <span class="inline-flex rounded-full h-2 w-2 bg-amber-400"></span>
+             <span class="text-xs font-mono font-bold text-amber-300">
+               MANUAL REFRESH MODE
              </span>
           </div>
         </div>
@@ -226,7 +220,6 @@ import { StatCardComponent } from '../ui/stat-card.component';
 })
 export class DashboardComponent {
   portfolio = inject(PortfolioService);
-  marketService = inject(MarketDataService);
   fb = inject(FormBuilder);
   
   buyForm = this.fb.group({
