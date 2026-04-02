@@ -1,5 +1,5 @@
 import { Injectable, signal, computed, inject, effect, untracked } from '@angular/core';
-import { MarketDataService, TokenData } from './market-data.service';
+import { MarketDataService } from './market-data.service';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 
 export interface Position {
@@ -157,77 +157,30 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      // Get Initial Data from DexScreener (Metadata + Price)
-      const data = await this.marketService.getTokenData(cleanMint);
-      
-      if (data) {
-        const price = parseFloat(data.priceUsd);
-        if (!Number.isFinite(price) || price <= 0) {
-          this.error.set("Invalid token price received.");
-          this.isLoading.set(false);
-          return;
-        }
-
-        const mcap =
-          typeof data.fdv === 'number' && Number.isFinite(data.fdv) && data.fdv > 0
-            ? data.fdv
-            : price * 1_000_000_000;
-        const tokensReceived = amountUsd / price;
-
-        const newPosition: Position = {
-          id: crypto.randomUUID(),
-          mint: data.baseToken.address,
-          symbol: data.baseToken.symbol,
-          name: data.baseToken.name,
-          // Use seeded image generator if no image is returned, ensuring uniqueness per token
-          imageUrl: data.info?.imageUrl || `https://picsum.photos/seed/${data.baseToken.address}/200`,
-          entryPrice: price,
-          currentPrice: price,
-          amountTokens: tokensReceived,
-          investedAmount: amountUsd,
-          entryMcap: mcap,
-          currentMcap: mcap,
-          timestamp: Date.now()
-        };
-
-        this.cashBalance.update(b => b - amountUsd);
-        this.positions.update(p => [newPosition, ...p]);
-        this.history.update(h => [{
-          id: crypto.randomUUID(),
-          type: 'BUY',
-          symbol: data.baseToken.symbol,
-          amountUsd: amountUsd,
-          marketCap: mcap,
-          timestamp: Date.now()
-        }, ...h]);
-
-        // SUBSCRIBE TO WEBSOCKET FOR UPDATES
-        this.marketService.subscribeToMint(data.baseToken.address);
-        return;
-      }
-
-      // Fallback for fresh Pump.fun tokens that DexScreener hasn't indexed yet.
-      const pump = await this.marketService.getPumpTraderToken(cleanMint);
-      if (!pump) {
-        this.error.set("Token not found yet (try again in a bit).");
-        this.isLoading.set(false);
-        return;
-      }
-
-      const quote = await this.marketService.getBestQuoteUsd(pump.mint);
+      // Always execute buys on the latest available valuation (WS tick first, then HTTP fallbacks).
+      const quote = await this.marketService.getLatestQuoteUsd(cleanMint, { timeoutMs: 20000 });
       if (!quote) {
-        this.error.set("Token price unavailable yet.");
-        this.isLoading.set(false);
+        this.error.set("Unable to fetch current token price. Try again.");
         return;
       }
+
+      // Fetch metadata separately (symbol/name/image). This may be missing for very new tokens.
+      const data = await this.marketService.getTokenData(cleanMint);
+      const pump = data ? null : await this.marketService.getPumpTraderToken(cleanMint);
+
+      const mint = data?.baseToken?.address || pump?.mint || cleanMint;
+      const symbol = data?.baseToken?.symbol || pump?.symbol || 'TOKEN';
+      const name = data?.baseToken?.name || pump?.name || symbol;
+      const imageUrl =
+        data?.info?.imageUrl || pump?.image_uri || `https://picsum.photos/seed/${mint}/200`;
 
       const tokensReceived = amountUsd / quote.priceUsd;
       const newPosition: Position = {
         id: crypto.randomUUID(),
-        mint: pump.mint,
-        symbol: pump.symbol || 'TOKEN',
-        name: pump.name || pump.symbol || pump.mint,
-        imageUrl: pump.image_uri || `https://picsum.photos/seed/${pump.mint}/200`,
+        mint,
+        symbol,
+        name,
+        imageUrl,
         entryPrice: quote.priceUsd,
         currentPrice: quote.priceUsd,
         amountTokens: tokensReceived,
@@ -242,14 +195,14 @@ export class PortfolioService {
       this.history.update(h => [{
         id: crypto.randomUUID(),
         type: 'BUY',
-        symbol: newPosition.symbol,
+        symbol,
         amountUsd: amountUsd,
         marketCap: quote.mcapUsd,
         timestamp: Date.now()
       }, ...h]);
 
       // SUBSCRIBE TO WEBSOCKET FOR UPDATES
-      this.marketService.subscribeToMint(newPosition.mint);
+      this.marketService.subscribeToMint(mint);
 
     } catch (e) {
       this.error.set("Failed to execute buy.");
@@ -266,10 +219,14 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      // Sell using the latest available valuation (DexScreener first, then PumpTrader).
-      const latest = await this.marketService.getBestQuoteUsd(pos.mint);
-      const executionPrice = latest?.priceUsd ?? pos.currentPrice;
-      const executionMcap = latest?.mcapUsd ?? pos.currentMcap;
+      // Always execute sells on the latest available valuation (WS tick first, then HTTP fallbacks).
+      const latest = await this.marketService.getLatestQuoteUsd(pos.mint, { timeoutMs: 20000 });
+      if (!latest) {
+        this.error.set("Unable to fetch current token price. Try again.");
+        return;
+      }
+      const executionPrice = latest.priceUsd;
+      const executionMcap = latest.mcapUsd;
 
       const sellValue = pos.amountTokens * executionPrice;
       const pnl = sellValue - pos.investedAmount;
@@ -308,9 +265,9 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
-      const quote = await this.marketService.getBestQuoteUsd(pos.mint);
+      const quote = await this.marketService.getLatestQuoteUsd(pos.mint, { timeoutMs: 20000 });
       if (!quote) {
-        this.error.set('Token not indexed yet. Try again in a bit.');
+        this.error.set('Unable to fetch current token price. Try again.');
         return;
       }
 

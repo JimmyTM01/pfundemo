@@ -63,6 +63,8 @@ export class MarketDataService {
   // SOL Price for conversions (PumpPortal gives data in SOL)
   // Default to a reasonable value so live updates still work if the HTTP fetch is blocked/rate-limited.
   private solPriceUsd = 150;
+  private lastTradeByMint = new Map<string, PumpPortalTrade>();
+  private lastTradeAtByMint = new Map<string, number>();
   
   // WebSocket State
   private socket$: WebSocketSubject<any> | null = null;
@@ -82,7 +84,10 @@ export class MarketDataService {
   async fetchSolPrice() {
     try {
       // Fetch SOL price from DexScreener (using Wrapped SOL address)
-      const response = await fetch('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112');
+      const response = await fetch(
+        `https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112?t=${Date.now()}`,
+        { cache: 'no-store' }
+      );
       if (!response.ok) throw new Error(`SOL price HTTP ${response.status}`);
 
       const data = await response.json();
@@ -101,7 +106,10 @@ export class MarketDataService {
     if (!mintAddress || mintAddress.length < 10) return null;
 
     try {
-      const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`);
+      const response = await fetch(
+        `https://api.dexscreener.com/latest/dex/tokens/${mintAddress}?t=${Date.now()}`,
+        { cache: 'no-store' }
+      );
       
       if (!response.ok) return null;
 
@@ -121,7 +129,7 @@ export class MarketDataService {
     if (!mintAddress || mintAddress.length < 10) return null;
 
     try {
-      const response = await fetch(`https://pumptrader.fun/tokens/${mintAddress}`);
+      const response = await fetch(`https://pumptrader.fun/tokens/${mintAddress}?t=${Date.now()}`, { cache: 'no-store' });
       if (!response.ok) return null;
 
       const data = await response.json();
@@ -168,6 +176,94 @@ export class MarketDataService {
     return null;
   }
 
+  private waitForConnected(timeoutMs: number): Promise<boolean> {
+    if (this.isConnected()) return Promise.resolve(true);
+
+    return new Promise(resolve => {
+      const start = Date.now();
+      const timer = setInterval(() => {
+        if (this.isConnected()) {
+          clearInterval(timer);
+          resolve(true);
+          return;
+        }
+        if (Date.now() - start >= timeoutMs) {
+          clearInterval(timer);
+          resolve(false);
+        }
+      }, 200);
+    });
+  }
+
+  private waitForNextTrade(mint: string, timeoutMs: number): Promise<PumpPortalTrade | null> {
+    return new Promise(resolve => {
+      const sub = this.tradeUpdates$.subscribe(trade => {
+        if (trade?.mint === mint) {
+          cleanup();
+          resolve(trade);
+        }
+      });
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve(null);
+      }, timeoutMs);
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        sub.unsubscribe();
+      };
+    });
+  }
+
+  // "Current" valuation for actions: WS trade update first (freshest), then HTTP fallbacks.
+  // This intentionally bypasses browser caches and may wait a bit for a new trade tick.
+  async getLatestQuoteUsd(
+    mintAddress: string,
+    opts?: { timeoutMs?: number; maxAgeMs?: number; waitForConnectionMs?: number }
+  ): Promise<{ priceUsd: number; mcapUsd: number } | null> {
+    const timeoutMs = opts?.timeoutMs ?? 15000;
+    const maxAgeMs = opts?.maxAgeMs ?? 8000;
+    const waitForConnectionMs = opts?.waitForConnectionMs ?? 5000;
+
+    const lastTrade = this.lastTradeByMint.get(mintAddress);
+    const lastAt = this.lastTradeAtByMint.get(mintAddress);
+    if (lastTrade && typeof lastAt === 'number' && Date.now() - lastAt <= maxAgeMs) {
+      await this.fetchSolPrice();
+      const { priceUsd, mcapUsd } = this.convertSolMcapToUsd(lastTrade.marketCapSol);
+      if (Number.isFinite(priceUsd) && priceUsd > 0 && Number.isFinite(mcapUsd) && mcapUsd > 0) {
+        return { priceUsd, mcapUsd };
+      }
+    }
+
+    const connected = this.isConnected() || (await this.waitForConnected(waitForConnectionMs));
+    if (connected) {
+      await this.fetchSolPrice();
+      this.subscribeToMint(mintAddress);
+
+      const trade = await this.waitForNextTrade(mintAddress, timeoutMs);
+      if (trade) {
+        const { priceUsd, mcapUsd } = this.convertSolMcapToUsd(trade.marketCapSol);
+        if (Number.isFinite(priceUsd) && priceUsd > 0 && Number.isFinite(mcapUsd) && mcapUsd > 0) {
+          return { priceUsd, mcapUsd };
+        }
+      }
+    }
+
+    const httpQuote = await this.getBestQuoteUsd(mintAddress);
+    if (httpQuote) return httpQuote;
+
+    // If all HTTP sources fail, fall back to the last WS trade we have (even if older).
+    if (lastTrade) {
+      await this.fetchSolPrice();
+      const { priceUsd, mcapUsd } = this.convertSolMcapToUsd(lastTrade.marketCapSol);
+      if (Number.isFinite(priceUsd) && priceUsd > 0 && Number.isFinite(mcapUsd) && mcapUsd > 0) {
+        return { priceUsd, mcapUsd };
+      }
+    }
+
+    return null;
+  }
+
   // --- WebSocket Logic (Real-time) ---
 
   private connectWebSocket() {
@@ -196,7 +292,11 @@ export class MarketDataService {
       retry({ delay: 3000 }), // Retry connection if it fails
       filter(msg => msg && msg.mint) // Only pass valid trade messages
     ).subscribe({
-      next: (msg: PumpPortalTrade) => this.tradeUpdates$.next(msg),
+      next: (msg: PumpPortalTrade) => {
+        this.lastTradeByMint.set(msg.mint, msg);
+        this.lastTradeAtByMint.set(msg.mint, Date.now());
+        this.tradeUpdates$.next(msg);
+      },
       error: (err) => console.error('WS Error:', err)
     });
   }
