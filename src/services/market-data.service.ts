@@ -63,18 +63,31 @@ export interface PumpTraderToken {
 })
 export class MarketDataService {
   private readonly websocketUrl = 'wss://pumpportal.fun/api/data';
+  private readonly liveSessionMs = 3 * 60 * 1000;
 
-  // SOL price is only needed when live/PumpTrader market cap is in SOL.
   private solPriceUsd = 150;
   private socket$: WebSocketSubject<unknown> | null = null;
-  private readonly liveMintRefs = new Map<string, number>();
+  private activeMint: string | null = null;
+  private latestLiveQuote: LiveTradeQuote | null = null;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   readonly tradeUpdates$ = new Subject<LiveTradeQuote>();
   readonly isConnected = signal(false);
+  readonly trackedMint = signal<string | null>(null);
 
   constructor() {
     void this.fetchSolPrice();
     interval(60000).subscribe(() => void this.fetchSolPrice());
+  }
+
+  private scheduleIdleClose(durationMs = this.liveSessionMs) {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+    }
+
+    this.idleTimer = setTimeout(() => {
+      this.stopLiveSession();
+    }, durationMs);
   }
 
   private connectWebSocket() {
@@ -85,7 +98,13 @@ export class MarketDataService {
       openObserver: {
         next: () => {
           this.isConnected.set(true);
-          this.resubscribeLiveMints();
+
+          if (this.activeMint) {
+            this.sendSocketMessage({
+              method: 'subscribeTokenTrade',
+              keys: [this.activeMint]
+            });
+          }
         }
       },
       closeObserver: {
@@ -93,9 +112,8 @@ export class MarketDataService {
           this.isConnected.set(false);
           this.socket$ = null;
 
-          // Reconnect only if some mint still needs live updates.
-          if (this.liveMintRefs.size > 0) {
-            setTimeout(() => this.connectWebSocket(), 2000);
+          if (this.activeMint) {
+            setTimeout(() => this.connectWebSocket(), 1500);
           }
         }
       }
@@ -111,67 +129,65 @@ export class MarketDataService {
       });
   }
 
-  private resubscribeLiveMints() {
-    for (const mint of this.liveMintRefs.keys()) {
-      this.sendSocketMessage({
-        method: 'subscribeTokenTrade',
-        keys: [mint]
-      });
-    }
-  }
-
   private sendSocketMessage(payload: object) {
     if (!this.socket$ || !this.isConnected()) return;
     this.socket$.next(payload as never);
   }
 
-  private retainLiveMint(mintAddress: string) {
+  private closeSocket() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+
+    if (this.socket$) {
+      this.socket$.complete();
+      this.socket$ = null;
+    }
+
+    this.isConnected.set(false);
+  }
+
+  startLiveSession(mintAddress: string, durationMs = this.liveSessionMs) {
     const mint = mintAddress.trim();
     if (!mint) return;
+    const mintChanged = this.activeMint !== mint;
 
-    const nextCount = (this.liveMintRefs.get(mint) ?? 0) + 1;
-    this.liveMintRefs.set(mint, nextCount);
+    if (this.activeMint && mintChanged && this.isConnected()) {
+      this.sendSocketMessage({
+        method: 'unsubscribeTokenTrade',
+        keys: [this.activeMint]
+      });
+    }
 
+    this.activeMint = mint;
+    this.trackedMint.set(mint);
     this.connectWebSocket();
-    if (nextCount === 1) {
+
+    if (this.isConnected() && mintChanged) {
       this.sendSocketMessage({
         method: 'subscribeTokenTrade',
         keys: [mint]
       });
     }
+
+    this.scheduleIdleClose(durationMs);
   }
 
-  private releaseLiveMint(mintAddress: string) {
-    const mint = mintAddress.trim();
-    if (!mint) return;
+  stopLiveSession() {
+    const mint = this.activeMint;
+    this.activeMint = null;
+    this.trackedMint.set(null);
+    this.latestLiveQuote = null;
 
-    const currentCount = this.liveMintRefs.get(mint);
-    if (!currentCount) return;
-
-    if (currentCount <= 1) {
-      this.liveMintRefs.delete(mint);
+    if (mint && this.isConnected()) {
       this.sendSocketMessage({
         method: 'unsubscribeTokenTrade',
         keys: [mint]
       });
-
-      if (this.liveMintRefs.size === 0 && this.socket$) {
-        setTimeout(() => {
-          if (this.liveMintRefs.size > 0 || !this.socket$) return;
-          this.socket$.complete();
-          this.socket$ = null;
-          this.isConnected.set(false);
-        }, 250);
-      }
-      return;
     }
 
-    this.liveMintRefs.set(mint, currentCount - 1);
-  }
-
-  watchMint(mintAddress: string): () => void {
-    this.retainLiveMint(mintAddress);
-    return () => this.releaseLiveMint(mintAddress);
+    this.closeSocket();
   }
 
   private async handleLivePayload(payload: Record<string, unknown>) {
@@ -181,10 +197,13 @@ export class MarketDataService {
     const quote = await this.mapLivePayloadToQuote(payload);
     if (!quote) return;
 
-    this.tradeUpdates$.next({
+    const next: LiveTradeQuote = {
       mint,
       ...quote
-    });
+    };
+
+    this.latestLiveQuote = next;
+    this.tradeUpdates$.next(next);
   }
 
   private async mapLivePayloadToQuote(payload: Record<string, unknown>): Promise<QuoteUsd | null> {
@@ -320,7 +339,11 @@ export class MarketDataService {
         : priceUsd * 1_000_000_000;
 
     if (!Number.isFinite(mcapUsd) || mcapUsd <= 0) return null;
-    return { priceUsd, mcapUsd, observedAt: Date.now() };
+    return {
+      priceUsd,
+      mcapUsd,
+      observedAt: Date.now()
+    };
   }
 
   private async getPumpQuoteUsd(token: PumpTraderToken | null): Promise<QuoteUsd | null> {
@@ -358,20 +381,34 @@ export class MarketDataService {
       Promise.resolve(this.getDexQuoteUsd(dexToken))
     ]);
 
-    // Prefer PumpTrader for fresh Pump.fun tokens, then DexScreener for graduated pairs.
     return pumpQuote ?? dexQuote;
   }
 
-  async getLiveQuoteOnce(mintAddress: string, timeoutMs = 1800): Promise<QuoteUsd | null> {
+  private getCachedLiveQuote(mintAddress: string, previousQuote?: Partial<QuoteUsd>): QuoteUsd | null {
+    if (!this.latestLiveQuote || this.latestLiveQuote.mint !== mintAddress) return null;
+
+    const previousObservedAt = this.toNumber(previousQuote?.observedAt) ?? 0;
+    return this.latestLiveQuote.observedAt > previousObservedAt ? this.latestLiveQuote : null;
+  }
+
+  async getLiveQuoteOnce(
+    mintAddress: string,
+    previousQuote?: Partial<QuoteUsd>,
+    timeoutMs = 1800
+  ): Promise<QuoteUsd | null> {
     const mint = mintAddress.trim();
     if (!mint) return null;
 
-    this.retainLiveMint(mint);
+    this.startLiveSession(mint);
+
+    const cached = this.getCachedLiveQuote(mint, previousQuote);
+    if (cached) return cached;
 
     try {
       return await firstValueFrom(
         this.tradeUpdates$.pipe(
           filter(update => update.mint === mint),
+          filter(update => update.observedAt > (this.toNumber(previousQuote?.observedAt) ?? 0)),
           map(({ mint: _mint, ...quote }) => quote),
           take(1),
           timeout({
@@ -381,61 +418,26 @@ export class MarketDataService {
       );
     } catch {
       return null;
-    } finally {
-      this.releaseLiveMint(mint);
     }
-  }
-
-  private isNewerQuote(nextQuote: QuoteUsd, previousQuote?: Partial<QuoteUsd>): boolean {
-    const previousObservedAt = this.toNumber(previousQuote?.observedAt);
-    if (!previousObservedAt) return true;
-    return nextQuote.observedAt > previousObservedAt;
-  }
-
-  private delay(ms: number) {
-    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   async getExecutionQuoteUsd(
     mintAddress: string,
     previousQuote?: Partial<QuoteUsd>,
-    timeoutMs = 2400
+    timeoutMs = 2200
   ): Promise<QuoteUsd | null> {
-    const livePromise = this.getLiveQuoteOnce(mintAddress, Math.min(timeoutMs, 1800));
-    let latestHttpQuote = await this.getLatestQuoteUsd(mintAddress);
+    this.startLiveSession(mintAddress);
 
-    if (!previousQuote) {
-      const liveQuote = await Promise.race([
-        livePromise,
-        this.delay(350).then(() => null)
-      ]);
-      return liveQuote ?? latestHttpQuote;
-    }
+    const liveQuote = await this.getLiveQuoteOnce(mintAddress, previousQuote, Math.min(timeoutMs, 1400));
+    if (liveQuote) return liveQuote;
 
-    const deadline = Date.now() + timeoutMs;
-    const firstLiveQuote = await Promise.race([
-      livePromise,
-      this.delay(900).then(() => null)
-    ]);
+    const latestHttpQuote = await this.getLatestQuoteUsd(mintAddress);
+    if (!latestHttpQuote) return null;
 
-    if (firstLiveQuote && this.isNewerQuote(firstLiveQuote, previousQuote)) {
-      return firstLiveQuote;
-    }
+    const previousObservedAt = this.toNumber(previousQuote?.observedAt) ?? 0;
+    if (latestHttpQuote.observedAt <= previousObservedAt) return null;
 
-    if (latestHttpQuote && this.isNewerQuote(latestHttpQuote, previousQuote)) {
-      return latestHttpQuote;
-    }
-
-    while (Date.now() < deadline) {
-      await this.delay(400);
-      latestHttpQuote = await this.getLatestQuoteUsd(mintAddress);
-
-      if (latestHttpQuote && this.isNewerQuote(latestHttpQuote, previousQuote)) {
-        return latestHttpQuote;
-      }
-    }
-
-    return null;
+    return latestHttpQuote;
   }
 
   async getTokenSnapshot(
@@ -448,17 +450,18 @@ export class MarketDataService {
     imageUrl: string;
     quote: QuoteUsd;
   } | null> {
+    const cleanMint = mintAddress.trim();
     const [dexToken, pumpToken, quote] = await Promise.all([
-      this.getTokenData(mintAddress),
-      this.getPumpTraderToken(mintAddress),
+      this.getTokenData(cleanMint),
+      this.getPumpTraderToken(cleanMint),
       options?.useExecutionQuote
-        ? this.getExecutionQuoteUsd(mintAddress)
-        : this.getLatestQuoteUsd(mintAddress)
+        ? this.getExecutionQuoteUsd(cleanMint)
+        : this.getLatestQuoteUsd(cleanMint)
     ]);
 
     if (!quote) return null;
 
-    const mint = dexToken?.baseToken.address || pumpToken?.mint || mintAddress;
+    const mint = dexToken?.baseToken.address || pumpToken?.mint || cleanMint;
     const symbol = dexToken?.baseToken.symbol || pumpToken?.symbol || 'TOKEN';
     const name = dexToken?.baseToken.name || pumpToken?.name || symbol;
     const imageUrl =

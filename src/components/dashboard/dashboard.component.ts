@@ -80,13 +80,17 @@ import { StatCardComponent } from '../ui/stat-card.component';
 
           <button 
             type="submit" 
-            [disabled]="buyForm.invalid || portfolio.isLoading()"
+            [disabled]="buyForm.invalid || portfolio.isLoading() || portfolio.positions().length > 0"
             class="w-full md:w-auto bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold py-3 px-8 rounded-lg transition-all shadow-lg shadow-purple-900/20 whitespace-nowrap"
           >
             <ng-container *ngIf="portfolio.isLoading(); else buyNowLabel">Processing...</ng-container>
             <ng-template #buyNowLabel>BUY NOW</ng-template>
           </button>
         </form>
+
+        <div *ngIf="portfolio.positions().length > 0" class="mt-4 bg-slate-800/40 text-slate-300 px-4 py-3 rounded-lg border border-slate-700 text-sm">
+          Single-token mode is on. Sell the current bag before opening a new trade.
+        </div>
 
         <div *ngIf="portfolio.error()" class="mt-4 bg-red-900/30 text-red-400 px-4 py-3 rounded-lg border border-red-900/50 text-sm flex items-center gap-2">
           <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd" /></svg>
@@ -99,7 +103,7 @@ import { StatCardComponent } from '../ui/stat-card.component';
         <div class="flex items-center justify-between">
           <h2 class="text-xl font-bold flex items-center gap-2">
             <span class="bg-blue-500 w-2 h-6 rounded-sm"></span>
-            Your Bags
+            Active Bag
             <span class="bg-slate-700 text-slate-300 text-xs px-2 py-1 rounded-full">{{ portfolio.positions().length }}</span>
           </h2>
 
@@ -263,7 +267,7 @@ export class DashboardComponent {
         )
       )
       .subscribe(({ mint, amount }) => {
-        if (this.portfolio.isLoading()) return;
+        if (this.portfolio.isLoading() || this.portfolio.positions().length > 0) return;
 
         const signature = `${mint}:${amount}`;
         if (signature === this.lastAutoBuySignature) return;

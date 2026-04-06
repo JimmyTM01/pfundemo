@@ -1,4 +1,5 @@
 import { Injectable, signal, computed, inject, effect } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { MarketDataService } from './market-data.service';
 
 export interface Position {
@@ -46,6 +47,23 @@ export class PortfolioService {
 
   constructor() {
     this.loadState();
+
+    this.marketService.tradeUpdates$
+      .pipe(takeUntilDestroyed())
+      .subscribe(update => {
+        this.positions.update(currentPositions =>
+          currentPositions.map(position =>
+            position.mint === update.mint
+              ? {
+                  ...position,
+                  currentPrice: update.priceUsd,
+                  currentMcap: update.mcapUsd,
+                  lastQuoteAt: update.observedAt
+                }
+              : position
+          )
+        );
+      });
 
     effect(() => {
       const state = {
@@ -95,8 +113,14 @@ export class PortfolioService {
                 ? position.timestamp
                 : Date.now()
         })) as Position[];
-        this.positions.set(savedPositions);
-        console.log(`Restored ${savedPositions.length} positions from storage.`);
+        const singlePosition = savedPositions.slice(0, 1);
+        this.positions.set(singlePosition);
+
+        if (singlePosition.length > 0) {
+          this.marketService.startLiveSession(singlePosition[0].mint);
+        }
+
+        console.log(`Restored ${singlePosition.length} active position from storage.`);
       } catch (e) {
         console.error('Failed to parse saved state', e);
       }
@@ -106,6 +130,11 @@ export class PortfolioService {
   async buyToken(mintAddress: string, amountUsd: number): Promise<boolean> {
     if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
       this.error.set("Invalid buy amount.");
+      return false;
+    }
+
+    if (this.positions().length > 0) {
+      this.error.set("Only one active token is allowed. Sell the current bag first.");
       return false;
     }
 
@@ -168,6 +197,8 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
+      this.marketService.startLiveSession(snapshot.mint);
+
       return true;
 
     } catch (e) {
@@ -217,6 +248,8 @@ export class PortfolioService {
         marketCap: executionMcap,
         timestamp: Date.now()
       }, ...h]);
+
+      this.marketService.stopLiveSession();
 
       return true;
 
@@ -283,6 +316,7 @@ export class PortfolioService {
     this.positions.set([]);
     this.history.set([]);
     this.error.set(null);
+    this.marketService.stopLiveSession();
     localStorage.removeItem(this.STORAGE_KEY);
   }
 }
