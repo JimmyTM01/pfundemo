@@ -1,5 +1,4 @@
 import { Injectable, signal, computed, inject, effect } from '@angular/core';
-import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { MarketDataService } from './market-data.service';
 
 export interface Position {
@@ -14,6 +13,7 @@ export interface Position {
   investedAmount: number;
   entryMcap: number;
   currentMcap: number;
+  lastQuoteAt: number;
   timestamp: number;
 }
 
@@ -33,7 +33,6 @@ export interface TradeHistory {
 export class PortfolioService {
   private marketService = inject(MarketDataService);
   private readonly STORAGE_KEY = 'pump_sim_state_v1';
-  private readonly autoRefreshWatchers = new Map<string, () => void>();
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Core State
@@ -42,36 +41,17 @@ export class PortfolioService {
   readonly history = signal<TradeHistory[]>([]);
   readonly isLoading = signal<boolean>(false);
   readonly refreshingPositionId = signal<string | null>(null);
+  readonly sellingPositionId = signal<string | null>(null);
   readonly error = signal<string | null>(null);
-  readonly autoRefreshEnabled = signal<boolean>(false);
 
   constructor() {
     this.loadState();
-
-    this.marketService.tradeUpdates$
-      .pipe(takeUntilDestroyed())
-      .subscribe(update => {
-        if (!this.autoRefreshEnabled()) return;
-
-        this.positions.update(currentPositions =>
-          currentPositions.map(position =>
-            position.mint === update.mint
-              ? {
-                  ...position,
-                  currentPrice: update.priceUsd,
-                  currentMcap: update.mcapUsd
-                }
-              : position
-          )
-        );
-      });
 
     effect(() => {
       const state = {
         cashBalance: this.cashBalance(),
         positions: this.positions(),
-        history: this.history(),
-        autoRefreshEnabled: this.autoRefreshEnabled()
+        history: this.history()
       };
 
       if (this.persistTimer) {
@@ -81,12 +61,6 @@ export class PortfolioService {
       this.persistTimer = setTimeout(() => {
         localStorage.setItem(this.STORAGE_KEY, JSON.stringify(state));
       }, 150);
-    });
-
-    effect(() => {
-      const enabled = this.autoRefreshEnabled();
-      const positions = this.positions();
-      this.syncAutoRefreshWatchers(enabled ? positions : []);
     });
   }
 
@@ -111,34 +85,22 @@ export class PortfolioService {
         const state = JSON.parse(saved);
         this.cashBalance.set(state.cashBalance);
         this.history.set(state.history || []);
-        this.autoRefreshEnabled.set(Boolean(state.autoRefreshEnabled));
         
-        const savedPositions: Position[] = state.positions || [];
+        const savedPositions: Position[] = (state.positions || []).map((position: Partial<Position>) => ({
+          ...position,
+          lastQuoteAt:
+            typeof position.lastQuoteAt === 'number' && Number.isFinite(position.lastQuoteAt)
+              ? position.lastQuoteAt
+              : typeof position.timestamp === 'number'
+                ? position.timestamp
+                : Date.now()
+        })) as Position[];
         this.positions.set(savedPositions);
         console.log(`Restored ${savedPositions.length} positions from storage.`);
       } catch (e) {
         console.error('Failed to parse saved state', e);
       }
     }
-  }
-
-  private syncAutoRefreshWatchers(positions: Position[]) {
-    const desiredMints = new Set(positions.map(position => position.mint));
-
-    for (const [mint, stopWatching] of this.autoRefreshWatchers.entries()) {
-      if (desiredMints.has(mint)) continue;
-      stopWatching();
-      this.autoRefreshWatchers.delete(mint);
-    }
-
-    for (const mint of desiredMints) {
-      if (this.autoRefreshWatchers.has(mint)) continue;
-      this.autoRefreshWatchers.set(mint, this.marketService.watchMint(mint));
-    }
-  }
-
-  setAutoRefreshEnabled(enabled: boolean) {
-    this.autoRefreshEnabled.set(enabled);
   }
 
   async buyToken(mintAddress: string, amountUsd: number): Promise<boolean> {
@@ -191,6 +153,7 @@ export class PortfolioService {
         investedAmount: amountUsd,
         entryMcap: snapshot.quote.mcapUsd,
         currentMcap: snapshot.quote.mcapUsd,
+        lastQuoteAt: snapshot.quote.observedAt,
         timestamp: Date.now()
       };
 
@@ -219,6 +182,7 @@ export class PortfolioService {
     const pos = this.positions().find(p => p.id === positionId);
     if (!pos) return false;
 
+    this.sellingPositionId.set(positionId);
     this.isLoading.set(true);
     this.error.set(null);
 
@@ -227,11 +191,12 @@ export class PortfolioService {
         pos.mint,
         {
           priceUsd: pos.currentPrice,
-          mcapUsd: pos.currentMcap
+          mcapUsd: pos.currentMcap,
+          observedAt: pos.lastQuoteAt
         }
       );
       if (!latest) {
-        this.error.set("Unable to fetch current token price. Try again.");
+        this.error.set("No newer market quote yet. Wait a moment and try sell again.");
         return false;
       }
       const executionPrice = latest.priceUsd;
@@ -260,6 +225,7 @@ export class PortfolioService {
       return false;
     } finally {
       this.isLoading.set(false);
+      this.sellingPositionId.set(null);
     }
   }
 
@@ -278,7 +244,8 @@ export class PortfolioService {
         pos.mint,
         {
           priceUsd: pos.currentPrice,
-          mcapUsd: pos.currentMcap
+          mcapUsd: pos.currentMcap,
+          observedAt: pos.lastQuoteAt
         },
         2000
       );
@@ -296,7 +263,8 @@ export class PortfolioService {
             ? {
                 ...p,
                 currentPrice: nextPrice,
-                currentMcap: Number.isFinite(nextMcap) && nextMcap > 0 ? nextMcap : p.currentMcap
+                currentMcap: Number.isFinite(nextMcap) && nextMcap > 0 ? nextMcap : p.currentMcap,
+                lastQuoteAt: quote.observedAt
               }
             : p
         )
@@ -311,7 +279,6 @@ export class PortfolioService {
   }
 
   reset() {
-    this.autoRefreshEnabled.set(false);
     this.cashBalance.set(100);
     this.positions.set([]);
     this.history.set([]);

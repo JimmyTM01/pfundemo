@@ -103,24 +103,11 @@ import { StatCardComponent } from '../ui/stat-card.component';
             <span class="bg-slate-700 text-slate-300 text-xs px-2 py-1 rounded-full">{{ portfolio.positions().length }}</span>
           </h2>
 
-          <div class="flex items-center gap-3">
-             <label class="relative inline-flex items-center cursor-pointer group">
-               <input
-                 type="checkbox"
-                 class="sr-only peer"
-                 [checked]="portfolio.autoRefreshEnabled()"
-                 (change)="onAutoRefreshToggle($any($event.target).checked)"
-               >
-               <div class="w-11 h-6 bg-slate-700/50 border border-slate-600 rounded-full peer-checked:bg-blue-600 peer-checked:border-blue-500 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:h-5 after:w-5 after:rounded-full after:bg-slate-300 after:border after:border-slate-400 after:transition-all peer-checked:after:bg-white"></div>
-               <span class="ms-3 text-sm font-medium text-slate-400 group-hover:text-slate-300 transition-colors">Auto Refresh</span>
-             </label>
-
-             <div class="flex items-center gap-2 bg-slate-800/50 px-3 py-1.5 rounded-full border border-white/5">
-                <span class="inline-flex rounded-full h-2 w-2" [class.bg-green-400]="portfolio.autoRefreshEnabled()" [class.bg-amber-400]="!portfolio.autoRefreshEnabled()"></span>
-                <span class="text-xs font-mono font-bold" [class.text-green-300]="portfolio.autoRefreshEnabled()" [class.text-amber-300]="!portfolio.autoRefreshEnabled()">
-                  {{ portfolio.autoRefreshEnabled() ? 'AUTO REFRESH ON' : 'MANUAL REFRESH' }}
-                </span>
-             </div>
+          <div class="flex items-center gap-2 bg-slate-800/50 px-3 py-1.5 rounded-full border border-white/5">
+             <span class="inline-flex rounded-full h-2 w-2 bg-amber-400"></span>
+             <span class="text-xs font-mono font-bold text-amber-300">
+               MANUAL REFRESH MODE
+             </span>
           </div>
         </div>
 
@@ -196,7 +183,7 @@ import { StatCardComponent } from '../ui/stat-card.component';
                  <button (click)="portfolio.sellPosition(pos.id)" 
                     [disabled]="portfolio.isLoading()"
                     class="w-full bg-red-500/10 hover:bg-red-500 hover:text-white text-red-400 border border-red-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">
-                   <ng-container *ngIf="portfolio.isLoading(); else sellLabel">SELLING...</ng-container>
+                   <ng-container *ngIf="portfolio.sellingPositionId() === pos.id; else sellLabel">WAITING PRICE...</ng-container>
                    <ng-template #sellLabel>SELL ALL</ng-template>
                  </button>
           </div>
@@ -302,10 +289,6 @@ export class DashboardComponent {
     }
 
     this.buyForm.controls.mint.setValue('');
-  }
-
-  onAutoRefreshToggle(enabled: boolean) {
-    this.portfolio.setAutoRefreshEnabled(enabled);
   }
 
   private normalizeMint(value: string | null | undefined): string {

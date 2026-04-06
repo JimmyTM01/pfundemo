@@ -13,6 +13,7 @@ import { webSocket, WebSocketSubject } from 'rxjs/webSocket';
 export interface QuoteUsd {
   priceUsd: number;
   mcapUsd: number;
+  observedAt: number;
 }
 
 export interface LiveTradeQuote extends QuoteUsd {
@@ -218,7 +219,8 @@ export class MarketDataService {
       if (resolvedMcapUsd && resolvedMcapUsd > 0) {
         return {
           priceUsd: directPriceUsd,
-          mcapUsd: resolvedMcapUsd
+          mcapUsd: resolvedMcapUsd,
+          observedAt: Date.now()
         };
       }
     }
@@ -230,7 +232,8 @@ export class MarketDataService {
 
     return {
       priceUsd,
-      mcapUsd
+      mcapUsd,
+      observedAt: Date.now()
     };
   }
 
@@ -317,7 +320,7 @@ export class MarketDataService {
         : priceUsd * 1_000_000_000;
 
     if (!Number.isFinite(mcapUsd) || mcapUsd <= 0) return null;
-    return { priceUsd, mcapUsd };
+    return { priceUsd, mcapUsd, observedAt: Date.now() };
   }
 
   private async getPumpQuoteUsd(token: PumpTraderToken | null): Promise<QuoteUsd | null> {
@@ -325,7 +328,8 @@ export class MarketDataService {
     if (mcapUsd && mcapUsd > 0) {
       return {
         priceUsd: mcapUsd / 1_000_000_000,
-        mcapUsd
+        mcapUsd,
+        observedAt: Date.now()
       };
     }
 
@@ -338,7 +342,8 @@ export class MarketDataService {
 
     return {
       priceUsd: mcapUsdFromSol / 1_000_000_000,
-      mcapUsd: mcapUsdFromSol
+      mcapUsd: mcapUsdFromSol,
+      observedAt: Date.now()
     };
   }
 
@@ -381,18 +386,10 @@ export class MarketDataService {
     }
   }
 
-  private hasMeaningfulQuoteChange(nextQuote: QuoteUsd, previousQuote?: Partial<QuoteUsd>): boolean {
-    if (!previousQuote) return true;
-
-    const previousPrice = this.toNumber(previousQuote.priceUsd);
-    const previousMcap = this.toNumber(previousQuote.mcapUsd);
-
-    if (!previousPrice || !previousMcap) return true;
-
-    const priceDelta = Math.abs(nextQuote.priceUsd - previousPrice);
-    const mcapDelta = Math.abs(nextQuote.mcapUsd - previousMcap);
-
-    return priceDelta > 0 || mcapDelta > 0;
+  private isNewerQuote(nextQuote: QuoteUsd, previousQuote?: Partial<QuoteUsd>): boolean {
+    const previousObservedAt = this.toNumber(previousQuote?.observedAt);
+    if (!previousObservedAt) return true;
+    return nextQuote.observedAt > previousObservedAt;
   }
 
   private delay(ms: number) {
@@ -421,11 +418,11 @@ export class MarketDataService {
       this.delay(900).then(() => null)
     ]);
 
-    if (firstLiveQuote && this.hasMeaningfulQuoteChange(firstLiveQuote, previousQuote)) {
+    if (firstLiveQuote && this.isNewerQuote(firstLiveQuote, previousQuote)) {
       return firstLiveQuote;
     }
 
-    if (latestHttpQuote && this.hasMeaningfulQuoteChange(latestHttpQuote, previousQuote)) {
+    if (latestHttpQuote && this.isNewerQuote(latestHttpQuote, previousQuote)) {
       return latestHttpQuote;
     }
 
@@ -433,12 +430,12 @@ export class MarketDataService {
       await this.delay(400);
       latestHttpQuote = await this.getLatestQuoteUsd(mintAddress);
 
-      if (latestHttpQuote && this.hasMeaningfulQuoteChange(latestHttpQuote, previousQuote)) {
+      if (latestHttpQuote && this.isNewerQuote(latestHttpQuote, previousQuote)) {
         return latestHttpQuote;
       }
     }
 
-    return latestHttpQuote ?? firstLiveQuote;
+    return null;
   }
 
   async getTokenSnapshot(
