@@ -64,6 +64,7 @@ export interface PumpTraderToken {
 export class MarketDataService {
   private readonly websocketUrl = 'wss://pumpportal.fun/api/data';
   private readonly liveSessionMs = 3 * 60 * 1000;
+  private readonly hotQuoteMaxAgeMs = 8000;
 
   private solPriceUsd = 150;
   private socket$: WebSocketSubject<unknown> | null = null;
@@ -384,16 +385,15 @@ export class MarketDataService {
     return pumpQuote ?? dexQuote;
   }
 
-  private getCachedLiveQuote(mintAddress: string, previousQuote?: Partial<QuoteUsd>): QuoteUsd | null {
+  private getCachedLiveQuote(mintAddress: string): QuoteUsd | null {
     if (!this.latestLiveQuote || this.latestLiveQuote.mint !== mintAddress) return null;
-
-    const previousObservedAt = this.toNumber(previousQuote?.observedAt) ?? 0;
-    return this.latestLiveQuote.observedAt > previousObservedAt ? this.latestLiveQuote : null;
+    if (Date.now() - this.latestLiveQuote.observedAt > this.hotQuoteMaxAgeMs) return null;
+    return this.latestLiveQuote;
   }
 
   async getLiveQuoteOnce(
     mintAddress: string,
-    previousQuote?: Partial<QuoteUsd>,
+    _previousQuote?: Partial<QuoteUsd>,
     timeoutMs = 1800
   ): Promise<QuoteUsd | null> {
     const mint = mintAddress.trim();
@@ -401,14 +401,13 @@ export class MarketDataService {
 
     this.startLiveSession(mint);
 
-    const cached = this.getCachedLiveQuote(mint, previousQuote);
+    const cached = this.getCachedLiveQuote(mint);
     if (cached) return cached;
 
     try {
       return await firstValueFrom(
         this.tradeUpdates$.pipe(
           filter(update => update.mint === mint),
-          filter(update => update.observedAt > (this.toNumber(previousQuote?.observedAt) ?? 0)),
           map(({ mint: _mint, ...quote }) => quote),
           take(1),
           timeout({
@@ -426,17 +425,18 @@ export class MarketDataService {
     previousQuote?: Partial<QuoteUsd>,
     timeoutMs = 2200
   ): Promise<QuoteUsd | null> {
+    const cached = this.getCachedLiveQuote(mintAddress.trim());
+    if (cached) {
+      this.startLiveSession(mintAddress);
+      return cached;
+    }
+
     this.startLiveSession(mintAddress);
 
     const liveQuote = await this.getLiveQuoteOnce(mintAddress, previousQuote, Math.min(timeoutMs, 1400));
     if (liveQuote) return liveQuote;
 
     const latestHttpQuote = await this.getLatestQuoteUsd(mintAddress);
-    if (!latestHttpQuote) return null;
-
-    const previousObservedAt = this.toNumber(previousQuote?.observedAt) ?? 0;
-    if (latestHttpQuote.observedAt <= previousObservedAt) return null;
-
     return latestHttpQuote;
   }
 

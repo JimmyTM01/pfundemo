@@ -227,7 +227,7 @@ export class PortfolioService {
         }
       );
       if (!latest) {
-        this.error.set("No newer market quote yet. Wait a moment and try sell again.");
+        this.error.set("No live quote available right now. Click update or try again in a moment.");
         return false;
       }
       const executionPrice = latest.priceUsd;
