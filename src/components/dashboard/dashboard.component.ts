@@ -1,7 +1,8 @@
-import { Component, inject } from '@angular/core';
+import { Component, inject, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule, FormBuilder, Validators } from '@angular/forms';
+import { interval } from 'rxjs';
 import { debounceTime, distinctUntilChanged, filter, map } from 'rxjs/operators';
 import { PortfolioService, Position } from '../../services/portfolio.service';
 import { MarketDataService } from '../../services/market-data.service';
@@ -87,7 +88,28 @@ import { StatCardComponent } from '../ui/stat-card.component';
             <ng-container *ngIf="portfolio.isLoading(); else buyNowLabel">Processing...</ng-container>
             <ng-template #buyNowLabel>BUY NOW</ng-template>
           </button>
+
+          <button
+            type="button"
+            (click)="onPasteAndBuy()"
+            [disabled]="portfolio.isLoading() || portfolio.positions().length > 0"
+            class="w-full md:w-auto bg-slate-800/70 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed text-slate-100 font-bold py-3 px-6 rounded-lg transition-all border border-slate-600 whitespace-nowrap"
+          >
+            PASTE + BUY
+          </button>
         </form>
+
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            *ngFor="let preset of amountPresets"
+            (click)="setAmountPreset(preset)"
+            class="text-xs font-mono px-3 py-1.5 rounded-full border transition-all"
+            [ngClass]="getAmountPresetClasses(preset)"
+          >
+            {{ '$' + preset }}
+          </button>
+        </div>
 
         <div *ngIf="portfolio.positions().length > 0" class="mt-4 bg-slate-800/40 text-slate-300 px-4 py-3 rounded-lg border border-slate-700 text-sm">
           Single-token mode is on. Sell the current bag before opening a new trade.
@@ -119,7 +141,7 @@ import { StatCardComponent } from '../ui/stat-card.component';
                [class.text-green-300]="hasLiveBag()"
                [class.text-amber-300]="!hasLiveBag()"
              >
-               {{ hasLiveBag() ? 'LIVE FEED' : 'IDLE FEED' }}
+               {{ getFeedBadgeLabel() }}
              </span>
           </div>
         </div>
@@ -149,7 +171,10 @@ import { StatCardComponent } from '../ui/stat-card.component';
                       class="text-[10px] font-mono px-1.5 py-0.5 rounded border"
                       [ngClass]="getPositionStatusClasses(pos)"
                     >
-                      {{ isLivePosition(pos) ? 'LIVE' : 'IDLE' }}
+                      {{ isFeedActive(pos) ? 'LIVE' : 'IDLE' }}
+                    </span>
+                    <span class="text-[10px] text-slate-500 font-mono">
+                      {{ getTickAgeLabel(pos) }}
                     </span>
                   </div>
                 </div>
@@ -245,7 +270,9 @@ export class DashboardComponent {
   portfolio = inject(PortfolioService);
   market = inject(MarketDataService);
   fb = inject(FormBuilder);
+  now = signal(Date.now());
   private lastAutoBuySignature: string | null = null;
+  readonly amountPresets = [1, 2, 5, 10];
   
   buyForm = this.fb.nonNullable.group({
     mint: ['', [Validators.required, Validators.minLength(32)]],
@@ -254,6 +281,10 @@ export class DashboardComponent {
   });
 
   constructor() {
+    interval(1000)
+      .pipe(takeUntilDestroyed())
+      .subscribe(() => this.now.set(Date.now()));
+
     this.buyForm.controls.mint.valueChanges
       .pipe(takeUntilDestroyed())
       .subscribe(value => {
@@ -313,13 +344,40 @@ export class DashboardComponent {
     this.buyForm.controls.mint.setValue('');
   }
 
+  async onPasteAndBuy() {
+    if (this.portfolio.isLoading() || this.portfolio.positions().length > 0) return;
+
+    try {
+      const text = await navigator.clipboard.readText();
+      const mint = this.normalizeMint(text);
+
+      if (!mint) {
+        this.portfolio.error.set('Clipboard is empty.');
+        return;
+      }
+
+      this.buyForm.controls.mint.setValue(mint);
+      await this.onBuy(mint);
+    } catch {
+      this.portfolio.error.set('Clipboard access failed. Paste the mint manually.');
+    }
+  }
+
+  setAmountPreset(amount: number) {
+    this.buyForm.controls.amount.setValue(amount);
+  }
+
   private normalizeMint(value: string | null | undefined): string {
     return (value ?? '').trim();
   }
 
   hasLiveBag(): boolean {
     const active = this.portfolio.positions()[0];
-    return active ? this.market.isHotForMint(active.mint) : false;
+    return active ? this.market.isTrackingMint(active.mint) : false;
+  }
+
+  isFeedActive(pos: Position): boolean {
+    return this.market.isTrackingMint(pos.mint);
   }
 
   isLivePosition(pos: Position): boolean {
@@ -334,10 +392,37 @@ export class DashboardComponent {
     return this.isLivePosition(pos) ? 'SELL NOW' : 'WAKE + SELL';
   }
 
+  getAmountPresetClasses(preset: number): string {
+    return this.buyForm.controls.amount.getRawValue() === preset
+      ? 'bg-purple-600 text-white border-purple-500'
+      : 'bg-slate-800/60 text-slate-300 border-slate-600 hover:border-slate-500';
+  }
+
   getPositionStatusClasses(pos: Position): string {
-    return this.isLivePosition(pos)
+    return this.isFeedActive(pos)
       ? 'text-green-300 border-green-500/30 bg-green-500/10'
       : 'text-slate-400 border-slate-600 bg-slate-800/70';
+  }
+
+  getFeedBadgeLabel(): string {
+    const active = this.portfolio.positions()[0];
+    if (!active || !this.isFeedActive(active)) return 'IDLE FEED';
+
+    const expiresAt = this.market.sessionExpiresAt();
+    if (!expiresAt) return 'LIVE FEED';
+
+    const secondsLeft = Math.max(0, Math.ceil((expiresAt - this.now()) / 1000));
+    return `LIVE FEED ${secondsLeft}s`;
+  }
+
+  getTickAgeLabel(pos: Position): string {
+    const deltaMs = Math.max(0, this.now() - pos.lastQuoteAt);
+
+    if (deltaMs < 1000) return 'tick now';
+    if (deltaMs < 60_000) return `tick ${(deltaMs / 1000).toFixed(1)}s ago`;
+
+    const minutes = Math.floor(deltaMs / 60_000);
+    return `tick ${minutes}m ago`;
   }
 
   // Helpers
