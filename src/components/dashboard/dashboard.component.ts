@@ -147,12 +147,7 @@ import { StatCardComponent } from '../ui/stat-card.component';
                     <span class="text-xs text-slate-500">{{ pos.name }}</span>
                     <span
                       class="text-[10px] font-mono px-1.5 py-0.5 rounded border"
-                      [class.text-green-300]="isLivePosition(pos)"
-                      [class.border-green-500/30]="isLivePosition(pos)"
-                      [class.bg-green-500/10]="isLivePosition(pos)"
-                      [class.text-slate-400]="!isLivePosition(pos)"
-                      [class.border-slate-600]="!isLivePosition(pos)"
-                      [class.bg-slate-800/70]="!isLivePosition(pos)"
+                      [ngClass]="getPositionStatusClasses(pos)"
                     >
                       {{ isLivePosition(pos) ? 'LIVE' : 'IDLE' }}
                     </span>
@@ -337,6 +332,12 @@ export class DashboardComponent {
 
   getSellLabel(pos: Position): string {
     return this.isLivePosition(pos) ? 'SELL NOW' : 'WAKE + SELL';
+  }
+
+  getPositionStatusClasses(pos: Position): string {
+    return this.isLivePosition(pos)
+      ? 'text-green-300 border-green-500/30 bg-green-500/10'
+      : 'text-slate-400 border-slate-600 bg-slate-800/70';
   }
 
   // Helpers
