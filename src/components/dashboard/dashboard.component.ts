@@ -2,7 +2,7 @@ import { Component, inject } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule, FormBuilder, Validators } from '@angular/forms';
-import { debounceTime, filter } from 'rxjs/operators';
+import { debounceTime, distinctUntilChanged, filter, map } from 'rxjs/operators';
 import { PortfolioService, Position } from '../../services/portfolio.service';
 import { StatCardComponent } from '../ui/stat-card.component';
 
@@ -72,6 +72,8 @@ import { StatCardComponent } from '../ui/stat-card.component';
             <input 
               type="number" 
               formControlName="amount"
+              step="0.01"
+              inputmode="decimal"
               class="w-full bg-slate-800/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-purple-500 font-mono text-sm font-bold text-center"
             >
           </div>
@@ -101,11 +103,24 @@ import { StatCardComponent } from '../ui/stat-card.component';
             <span class="bg-slate-700 text-slate-300 text-xs px-2 py-1 rounded-full">{{ portfolio.positions().length }}</span>
           </h2>
 
-          <div class="flex items-center gap-2 bg-slate-800/50 px-3 py-1.5 rounded-full border border-white/5">
-             <span class="inline-flex rounded-full h-2 w-2 bg-amber-400"></span>
-             <span class="text-xs font-mono font-bold text-amber-300">
-               MANUAL REFRESH MODE
-             </span>
+          <div class="flex items-center gap-3">
+             <label class="relative inline-flex items-center cursor-pointer group">
+               <input
+                 type="checkbox"
+                 class="sr-only peer"
+                 [checked]="portfolio.autoRefreshEnabled()"
+                 (change)="onAutoRefreshToggle($any($event.target).checked)"
+               >
+               <div class="w-11 h-6 bg-slate-700/50 border border-slate-600 rounded-full peer-checked:bg-blue-600 peer-checked:border-blue-500 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:h-5 after:w-5 after:rounded-full after:bg-slate-300 after:border after:border-slate-400 after:transition-all peer-checked:after:bg-white"></div>
+               <span class="ms-3 text-sm font-medium text-slate-400 group-hover:text-slate-300 transition-colors">Auto Refresh</span>
+             </label>
+
+             <div class="flex items-center gap-2 bg-slate-800/50 px-3 py-1.5 rounded-full border border-white/5">
+                <span class="inline-flex rounded-full h-2 w-2" [class.bg-green-400]="portfolio.autoRefreshEnabled()" [class.bg-amber-400]="!portfolio.autoRefreshEnabled()"></span>
+                <span class="text-xs font-mono font-bold" [class.text-green-300]="portfolio.autoRefreshEnabled()" [class.text-amber-300]="!portfolio.autoRefreshEnabled()">
+                  {{ portfolio.autoRefreshEnabled() ? 'AUTO REFRESH ON' : 'MANUAL REFRESH' }}
+                </span>
+             </div>
           </div>
         </div>
 
@@ -221,32 +236,80 @@ import { StatCardComponent } from '../ui/stat-card.component';
 export class DashboardComponent {
   portfolio = inject(PortfolioService);
   fb = inject(FormBuilder);
+  private lastAutoBuySignature: string | null = null;
   
-  buyForm = this.fb.group({
+  buyForm = this.fb.nonNullable.group({
     mint: ['', [Validators.required, Validators.minLength(32)]],
     amount: [2, [Validators.required, Validators.min(0.01), Validators.max(1000)]],
     autoBuy: [false]
   });
 
   constructor() {
-    // Auto-buy logic
-    this.buyForm.controls.mint.valueChanges.pipe(
-      takeUntilDestroyed(),
-      debounceTime(300), 
-      filter(val => !!val && val.length >= 32 && (this.buyForm.get('autoBuy')?.value ?? false))
-    ).subscribe(() => {
-      if (this.buyForm.valid && !this.portfolio.isLoading()) {
-        this.onBuy();
-      }
-    });
+    this.buyForm.controls.mint.valueChanges
+      .pipe(takeUntilDestroyed())
+      .subscribe(value => {
+        if (!this.normalizeMint(value)) {
+          this.lastAutoBuySignature = null;
+        }
+      });
+
+    // Auto-buy should use the latest amount value, not the initial default.
+    this.buyForm.valueChanges
+      .pipe(
+        takeUntilDestroyed(),
+        debounceTime(450),
+        map(() => {
+          const mint = this.normalizeMint(this.buyForm.controls.mint.getRawValue());
+          const amount = Number(this.buyForm.controls.amount.getRawValue());
+          const autoBuy = this.buyForm.controls.autoBuy.getRawValue();
+          return { mint, amount, autoBuy };
+        }),
+        filter(
+          ({ mint, amount, autoBuy }) =>
+            autoBuy && mint.length >= 32 && Number.isFinite(amount) && amount >= 0.01
+        ),
+        distinctUntilChanged(
+          (prev, curr) =>
+            prev.mint === curr.mint &&
+            prev.amount === curr.amount &&
+            prev.autoBuy === curr.autoBuy
+        )
+      )
+      .subscribe(({ mint, amount }) => {
+        if (this.portfolio.isLoading()) return;
+
+        const signature = `${mint}:${amount}`;
+        if (signature === this.lastAutoBuySignature) return;
+
+        this.lastAutoBuySignature = signature;
+        void this.onBuy(mint, amount);
+      });
   }
 
-  onBuy() {
-    if (this.buyForm.valid) {
-      const { mint, amount } = this.buyForm.value;
-      this.portfolio.buyToken(mint!, amount!);
-      this.buyForm.get('mint')?.reset(); 
+  async onBuy(mintOverride?: string, amountOverride?: number) {
+    const mint = this.normalizeMint(mintOverride ?? this.buyForm.controls.mint.getRawValue());
+    const amount = Number(amountOverride ?? this.buyForm.controls.amount.getRawValue());
+
+    if (!mint || !Number.isFinite(amount) || amount < 0.01) {
+      this.buyForm.markAllAsTouched();
+      return;
     }
+
+    const didBuy = await this.portfolio.buyToken(mint, amount);
+    if (!didBuy) {
+      this.lastAutoBuySignature = null;
+      return;
+    }
+
+    this.buyForm.controls.mint.setValue('');
+  }
+
+  onAutoRefreshToggle(enabled: boolean) {
+    this.portfolio.setAutoRefreshEnabled(enabled);
+  }
+
+  private normalizeMint(value: string | null | undefined): string {
+    return (value ?? '').trim();
   }
 
   // Helpers

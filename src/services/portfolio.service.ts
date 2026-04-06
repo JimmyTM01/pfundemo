@@ -1,4 +1,5 @@
 import { Injectable, signal, computed, inject, effect } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { MarketDataService } from './market-data.service';
 
 export interface Position {
@@ -32,6 +33,8 @@ export interface TradeHistory {
 export class PortfolioService {
   private marketService = inject(MarketDataService);
   private readonly STORAGE_KEY = 'pump_sim_state_v1';
+  private readonly autoRefreshWatchers = new Map<string, () => void>();
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Core State
   readonly cashBalance = signal<number>(100);
@@ -40,17 +43,50 @@ export class PortfolioService {
   readonly isLoading = signal<boolean>(false);
   readonly refreshingPositionId = signal<string | null>(null);
   readonly error = signal<string | null>(null);
+  readonly autoRefreshEnabled = signal<boolean>(false);
 
   constructor() {
     this.loadState();
+
+    this.marketService.tradeUpdates$
+      .pipe(takeUntilDestroyed())
+      .subscribe(update => {
+        if (!this.autoRefreshEnabled()) return;
+
+        this.positions.update(currentPositions =>
+          currentPositions.map(position =>
+            position.mint === update.mint
+              ? {
+                  ...position,
+                  currentPrice: update.priceUsd,
+                  currentMcap: update.mcapUsd
+                }
+              : position
+          )
+        );
+      });
 
     effect(() => {
       const state = {
         cashBalance: this.cashBalance(),
         positions: this.positions(),
-        history: this.history()
+        history: this.history(),
+        autoRefreshEnabled: this.autoRefreshEnabled()
       };
-      localStorage.setItem(this.STORAGE_KEY, JSON.stringify(state));
+
+      if (this.persistTimer) {
+        clearTimeout(this.persistTimer);
+      }
+
+      this.persistTimer = setTimeout(() => {
+        localStorage.setItem(this.STORAGE_KEY, JSON.stringify(state));
+      }, 150);
+    });
+
+    effect(() => {
+      const enabled = this.autoRefreshEnabled();
+      const positions = this.positions();
+      this.syncAutoRefreshWatchers(enabled ? positions : []);
     });
   }
 
@@ -75,11 +111,10 @@ export class PortfolioService {
         const state = JSON.parse(saved);
         this.cashBalance.set(state.cashBalance);
         this.history.set(state.history || []);
+        this.autoRefreshEnabled.set(Boolean(state.autoRefreshEnabled));
         
         const savedPositions: Position[] = state.positions || [];
         this.positions.set(savedPositions);
-
-        // Initial subscription is now handled by the effect above when connection opens
         console.log(`Restored ${savedPositions.length} positions from storage.`);
       } catch (e) {
         console.error('Failed to parse saved state', e);
@@ -87,10 +122,34 @@ export class PortfolioService {
     }
   }
 
-  async buyToken(mintAddress: string, amountUsd: number) {
+  private syncAutoRefreshWatchers(positions: Position[]) {
+    const desiredMints = new Set(positions.map(position => position.mint));
+
+    for (const [mint, stopWatching] of this.autoRefreshWatchers.entries()) {
+      if (desiredMints.has(mint)) continue;
+      stopWatching();
+      this.autoRefreshWatchers.delete(mint);
+    }
+
+    for (const mint of desiredMints) {
+      if (this.autoRefreshWatchers.has(mint)) continue;
+      this.autoRefreshWatchers.set(mint, this.marketService.watchMint(mint));
+    }
+  }
+
+  setAutoRefreshEnabled(enabled: boolean) {
+    this.autoRefreshEnabled.set(enabled);
+  }
+
+  async buyToken(mintAddress: string, amountUsd: number): Promise<boolean> {
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      this.error.set("Invalid buy amount.");
+      return false;
+    }
+
     if (amountUsd > this.cashBalance()) {
       this.error.set("Insufficient funds!");
-      return;
+      return false;
     }
 
     // Sanitize Mint Address
@@ -105,17 +164,19 @@ export class PortfolioService {
     
     if (cleanMint.length < 30) {
       this.error.set("Invalid mint address detected.");
-      return;
+      return false;
     }
 
     this.isLoading.set(true);
     this.error.set(null);
 
     try {
-      const snapshot = await this.marketService.getTokenSnapshot(cleanMint);
+      const snapshot = await this.marketService.getTokenSnapshot(cleanMint, {
+        useExecutionQuote: true
+      });
       if (!snapshot) {
         this.error.set("Unable to fetch current token price. Try again.");
-        return;
+        return false;
       }
       const tokensReceived = amountUsd / snapshot.quote.priceUsd;
       const newPosition: Position = {
@@ -144,25 +205,34 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
+      return true;
+
     } catch (e) {
       this.error.set("Failed to execute buy.");
+      return false;
     } finally {
       this.isLoading.set(false);
     }
   }
 
-  async sellPosition(positionId: string) {
+  async sellPosition(positionId: string): Promise<boolean> {
     const pos = this.positions().find(p => p.id === positionId);
-    if (!pos) return;
+    if (!pos) return false;
 
     this.isLoading.set(true);
     this.error.set(null);
 
     try {
-      const latest = await this.marketService.getLatestQuoteUsd(pos.mint);
+      const latest = await this.marketService.getExecutionQuoteUsd(
+        pos.mint,
+        {
+          priceUsd: pos.currentPrice,
+          mcapUsd: pos.currentMcap
+        }
+      );
       if (!latest) {
         this.error.set("Unable to fetch current token price. Try again.");
-        return;
+        return false;
       }
       const executionPrice = latest.priceUsd;
       const executionMcap = latest.mcapUsd;
@@ -183,28 +253,38 @@ export class PortfolioService {
         timestamp: Date.now()
       }, ...h]);
 
+      return true;
+
     } catch (e) {
       this.error.set("Failed to execute sell.");
+      return false;
     } finally {
       this.isLoading.set(false);
     }
   }
 
-  async refreshPosition(positionId: string) {
-    if (this.isLoading()) return;
-    if (this.refreshingPositionId()) return;
+  async refreshPosition(positionId: string): Promise<boolean> {
+    if (this.isLoading()) return false;
+    if (this.refreshingPositionId()) return false;
 
     const pos = this.positions().find(p => p.id === positionId);
-    if (!pos) return;
+    if (!pos) return false;
 
     this.refreshingPositionId.set(positionId);
     this.error.set(null);
 
     try {
-      const quote = await this.marketService.getLatestQuoteUsd(pos.mint);
+      const quote = await this.marketService.getExecutionQuoteUsd(
+        pos.mint,
+        {
+          priceUsd: pos.currentPrice,
+          mcapUsd: pos.currentMcap
+        },
+        2000
+      );
       if (!quote) {
         this.error.set('Unable to fetch current token price. Try again.');
-        return;
+        return false;
       }
 
       const nextPrice = quote.priceUsd;
@@ -221,14 +301,17 @@ export class PortfolioService {
             : p
         )
       );
+      return true;
     } catch (e) {
       this.error.set('Failed to refresh token data.');
+      return false;
     } finally {
       this.refreshingPositionId.set(null);
     }
   }
 
   reset() {
+    this.autoRefreshEnabled.set(false);
     this.cashBalance.set(100);
     this.positions.set([]);
     this.history.set([]);
