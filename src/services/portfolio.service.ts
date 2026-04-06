@@ -33,7 +33,8 @@ export interface TradeHistory {
 })
 export class PortfolioService {
   private marketService = inject(MarketDataService);
-  private readonly STORAGE_KEY = 'pump_sim_state_v1';
+  private readonly STORAGE_KEY = 'pump_sim_state_v2';
+  private readonly LEGACY_STORAGE_KEYS = ['pump_sim_state_v1'];
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Core State
@@ -96,23 +97,90 @@ export class PortfolioService {
     return (this.totalPnL() / 100) * 100;
   });
 
+  private toFiniteNumber(value: unknown, fallback: number): number {
+    const next = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+    return Number.isFinite(next) ? next : fallback;
+  }
+
+  private sanitizePosition(position: Partial<Position> | null | undefined): Position | null {
+    if (!position || typeof position.mint !== 'string' || typeof position.symbol !== 'string') {
+      return null;
+    }
+
+    const amountTokens = this.toFiniteNumber(position.amountTokens, 0);
+    const currentPrice = this.toFiniteNumber(position.currentPrice, 0);
+    const investedAmount = this.toFiniteNumber(position.investedAmount, 0);
+
+    if (amountTokens <= 0 || currentPrice < 0 || investedAmount < 0) {
+      return null;
+    }
+
+    return {
+      id: typeof position.id === 'string' ? position.id : crypto.randomUUID(),
+      mint: position.mint,
+      symbol: position.symbol,
+      name: typeof position.name === 'string' ? position.name : position.symbol,
+      imageUrl:
+        typeof position.imageUrl === 'string' && position.imageUrl.length > 0
+          ? position.imageUrl
+          : `https://picsum.photos/seed/${position.mint}/200`,
+      entryPrice: this.toFiniteNumber(position.entryPrice, currentPrice),
+      currentPrice,
+      amountTokens,
+      investedAmount,
+      entryMcap: this.toFiniteNumber(position.entryMcap, 0),
+      currentMcap: this.toFiniteNumber(position.currentMcap, 0),
+      lastQuoteAt: this.toFiniteNumber(position.lastQuoteAt, Date.now()),
+      timestamp: this.toFiniteNumber(position.timestamp, Date.now())
+    };
+  }
+
+  private sanitizeTrade(trade: Partial<TradeHistory> | null | undefined): TradeHistory | null {
+    if (
+      !trade ||
+      (trade.type !== 'BUY' && trade.type !== 'SELL') ||
+      typeof trade.symbol !== 'string'
+    ) {
+      return null;
+    }
+
+    return {
+      id: typeof trade.id === 'string' ? trade.id : crypto.randomUUID(),
+      type: trade.type,
+      symbol: trade.symbol,
+      amountUsd: this.toFiniteNumber(trade.amountUsd, 0),
+      pnl:
+        typeof trade.pnl === 'number' && Number.isFinite(trade.pnl)
+          ? trade.pnl
+          : undefined,
+      marketCap: this.toFiniteNumber(trade.marketCap, 0),
+      timestamp: this.toFiniteNumber(trade.timestamp, Date.now())
+    };
+  }
+
   private loadState() {
-    const saved = localStorage.getItem(this.STORAGE_KEY);
+    const saved =
+      localStorage.getItem(this.STORAGE_KEY) ??
+      this.LEGACY_STORAGE_KEYS.map(key => localStorage.getItem(key)).find(Boolean) ??
+      null;
+
     if (saved) {
       try {
         const state = JSON.parse(saved);
-        this.cashBalance.set(state.cashBalance);
-        this.history.set(state.history || []);
-        
-        const savedPositions: Position[] = (state.positions || []).map((position: Partial<Position>) => ({
-          ...position,
-          lastQuoteAt:
-            typeof position.lastQuoteAt === 'number' && Number.isFinite(position.lastQuoteAt)
-              ? position.lastQuoteAt
-              : typeof position.timestamp === 'number'
-                ? position.timestamp
-                : Date.now()
-        })) as Position[];
+        this.cashBalance.set(this.toFiniteNumber(state.cashBalance, 100));
+        this.history.set(
+          Array.isArray(state.history)
+            ? state.history
+                .map((trade: Partial<TradeHistory>) => this.sanitizeTrade(trade))
+                .filter((trade: TradeHistory | null): trade is TradeHistory => trade !== null)
+            : []
+        );
+
+        const savedPositions: Position[] = Array.isArray(state.positions)
+          ? state.positions
+              .map((position: Partial<Position>) => this.sanitizePosition(position))
+              .filter((position: Position | null): position is Position => position !== null)
+          : [];
         const singlePosition = savedPositions.slice(0, 1);
         this.positions.set(singlePosition);
 
@@ -318,5 +386,6 @@ export class PortfolioService {
     this.error.set(null);
     this.marketService.stopLiveSession();
     localStorage.removeItem(this.STORAGE_KEY);
+    this.LEGACY_STORAGE_KEYS.forEach(key => localStorage.removeItem(key));
   }
 }
