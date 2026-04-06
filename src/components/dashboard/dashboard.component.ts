@@ -4,6 +4,7 @@ import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule, FormBuilder, Validators } from '@angular/forms';
 import { debounceTime, distinctUntilChanged, filter, map } from 'rxjs/operators';
 import { PortfolioService, Position } from '../../services/portfolio.service';
+import { MarketDataService } from '../../services/market-data.service';
 import { StatCardComponent } from '../ui/stat-card.component';
 
 @Component({
@@ -108,9 +109,17 @@ import { StatCardComponent } from '../ui/stat-card.component';
           </h2>
 
           <div class="flex items-center gap-2 bg-slate-800/50 px-3 py-1.5 rounded-full border border-white/5">
-             <span class="inline-flex rounded-full h-2 w-2 bg-amber-400"></span>
-             <span class="text-xs font-mono font-bold text-amber-300">
-               MANUAL REFRESH MODE
+             <span
+               class="inline-flex rounded-full h-2 w-2"
+               [class.bg-green-400]="hasLiveBag()"
+               [class.bg-amber-400]="!hasLiveBag()"
+             ></span>
+             <span
+               class="text-xs font-mono font-bold"
+               [class.text-green-300]="hasLiveBag()"
+               [class.text-amber-300]="!hasLiveBag()"
+             >
+               {{ hasLiveBag() ? 'LIVE FEED' : 'IDLE FEED' }}
              </span>
           </div>
         </div>
@@ -134,7 +143,20 @@ import { StatCardComponent } from '../ui/stat-card.component';
                 <div>
                   <div class="font-bold text-lg leading-none mb-1">{{ pos.symbol }}</div>
                   <div class="text-xs text-slate-400 font-mono truncate max-w-[150px]">{{ pos.mint }}</div>
-                  <div class="text-xs text-slate-500 mt-1">{{ pos.name }}</div>
+                  <div class="flex items-center gap-2 mt-1">
+                    <span class="text-xs text-slate-500">{{ pos.name }}</span>
+                    <span
+                      class="text-[10px] font-mono px-1.5 py-0.5 rounded border"
+                      [class.text-green-300]="isLivePosition(pos)"
+                      [class.border-green-500/30]="isLivePosition(pos)"
+                      [class.bg-green-500/10]="isLivePosition(pos)"
+                      [class.text-slate-400]="!isLivePosition(pos)"
+                      [class.border-slate-600]="!isLivePosition(pos)"
+                      [class.bg-slate-800/70]="!isLivePosition(pos)"
+                    >
+                      {{ isLivePosition(pos) ? 'LIVE' : 'IDLE' }}
+                    </span>
+                  </div>
                 </div>
               </div>
 
@@ -182,13 +204,13 @@ import { StatCardComponent } from '../ui/stat-card.component';
                  <button (click)="portfolio.refreshPosition(pos.id)"
                     [disabled]="portfolio.isLoading() || portfolio.refreshingPositionId() === pos.id"
                     class="w-full bg-slate-500/10 hover:bg-slate-500/20 text-slate-300 border border-slate-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">
-                   {{ portfolio.refreshingPositionId() === pos.id ? 'UPDATING...' : 'UPDATE' }}
+                   {{ portfolio.refreshingPositionId() === pos.id ? 'SYNCING...' : getUpdateLabel(pos) }}
                  </button>
                  <button (click)="portfolio.sellPosition(pos.id)" 
                     [disabled]="portfolio.isLoading()"
                     class="w-full bg-red-500/10 hover:bg-red-500 hover:text-white text-red-400 border border-red-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">
                    <ng-container *ngIf="portfolio.sellingPositionId() === pos.id; else sellLabel">WAITING PRICE...</ng-container>
-                   <ng-template #sellLabel>SELL ALL</ng-template>
+                   <ng-template #sellLabel>{{ getSellLabel(pos) }}</ng-template>
                  </button>
           </div>
         </div>
@@ -226,6 +248,7 @@ import { StatCardComponent } from '../ui/stat-card.component';
 })
 export class DashboardComponent {
   portfolio = inject(PortfolioService);
+  market = inject(MarketDataService);
   fb = inject(FormBuilder);
   private lastAutoBuySignature: string | null = null;
   
@@ -297,6 +320,23 @@ export class DashboardComponent {
 
   private normalizeMint(value: string | null | undefined): string {
     return (value ?? '').trim();
+  }
+
+  hasLiveBag(): boolean {
+    const active = this.portfolio.positions()[0];
+    return active ? this.market.isHotForMint(active.mint) : false;
+  }
+
+  isLivePosition(pos: Position): boolean {
+    return this.market.isHotForMint(pos.mint);
+  }
+
+  getUpdateLabel(pos: Position): string {
+    return this.isLivePosition(pos) ? 'SYNC NOW' : 'WAKE FEED';
+  }
+
+  getSellLabel(pos: Position): string {
+    return this.isLivePosition(pos) ? 'SELL NOW' : 'WAKE + SELL';
   }
 
   // Helpers

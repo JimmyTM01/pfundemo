@@ -63,7 +63,7 @@ export interface PumpTraderToken {
 })
 export class MarketDataService {
   private readonly websocketUrl = 'wss://pumpportal.fun/api/data';
-  private readonly liveSessionMs = 3 * 60 * 1000;
+  private readonly liveSessionMs = 90 * 1000;
   private readonly hotQuoteMaxAgeMs = 8000;
 
   private solPriceUsd = 150;
@@ -75,6 +75,8 @@ export class MarketDataService {
   readonly tradeUpdates$ = new Subject<LiveTradeQuote>();
   readonly isConnected = signal(false);
   readonly trackedMint = signal<string | null>(null);
+  readonly lastLiveQuoteAt = signal<number | null>(null);
+  readonly sessionExpiresAt = signal<number | null>(null);
 
   constructor() {
     void this.fetchSolPrice();
@@ -149,6 +151,22 @@ export class MarketDataService {
     this.isConnected.set(false);
   }
 
+  isHotForMint(mintAddress: string): boolean {
+    const mint = mintAddress.trim();
+    if (!mint) return false;
+    if (this.trackedMint() !== mint) return false;
+    if (!this.isConnected()) return false;
+
+    const lastQuoteAt = this.lastLiveQuoteAt();
+    if (!lastQuoteAt) return false;
+
+    return Date.now() - lastQuoteAt <= this.hotQuoteMaxAgeMs;
+  }
+
+  isTrackingMint(mintAddress: string): boolean {
+    return this.trackedMint() === mintAddress.trim() && this.isConnected();
+  }
+
   startLiveSession(mintAddress: string, durationMs = this.liveSessionMs) {
     const mint = mintAddress.trim();
     if (!mint) return;
@@ -163,6 +181,7 @@ export class MarketDataService {
 
     this.activeMint = mint;
     this.trackedMint.set(mint);
+    this.sessionExpiresAt.set(Date.now() + durationMs);
     this.connectWebSocket();
 
     if (this.isConnected() && mintChanged) {
@@ -180,6 +199,8 @@ export class MarketDataService {
     this.activeMint = null;
     this.trackedMint.set(null);
     this.latestLiveQuote = null;
+    this.lastLiveQuoteAt.set(null);
+    this.sessionExpiresAt.set(null);
 
     if (mint && this.isConnected()) {
       this.sendSocketMessage({
@@ -204,6 +225,7 @@ export class MarketDataService {
     };
 
     this.latestLiveQuote = next;
+    this.lastLiveQuoteAt.set(next.observedAt);
     this.tradeUpdates$.next(next);
   }
 
