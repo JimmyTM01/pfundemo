@@ -227,8 +227,12 @@ export class PortfolioService {
     this.error.set(null);
 
     try {
+      // Prevent immediate re-buy from reusing a stale in-memory execution quote.
+      this.marketService.clearLiveQuoteCache(cleanMint);
+
       const snapshot = await this.marketService.getTokenSnapshot(cleanMint, {
-        useExecutionQuote: true
+        useExecutionQuote: true,
+        forceFreshQuote: true
       });
       if (!snapshot) {
         this.error.set("Unable to fetch current token price. Try again.");
@@ -316,6 +320,7 @@ export class PortfolioService {
       }, ...h]);
 
       this.marketService.stopLiveSession();
+      this.marketService.clearLiveQuoteCache(pos.mint);
       this.lowTickStrikes.delete(pos.mint);
 
       return true;

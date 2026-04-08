@@ -152,6 +152,17 @@ export class MarketDataService {
     this.isConnected.set(false);
   }
 
+  clearLiveQuoteCache(mintAddress?: string) {
+    const mint = mintAddress?.trim();
+    if (mint && this.latestLiveQuote?.mint !== mint) return;
+
+    this.latestLiveQuote = null;
+
+    if (!mint || this.trackedMint() === mint) {
+      this.lastLiveQuoteAt.set(null);
+    }
+  }
+
   isHotForMint(mintAddress: string): boolean {
     const mint = mintAddress.trim();
     if (!mint) return false;
@@ -510,15 +521,19 @@ export class MarketDataService {
   async getLiveQuoteOnce(
     mintAddress: string,
     _previousQuote?: Partial<QuoteUsd>,
-    timeoutMs = 1800
+    timeoutMs = 1800,
+    options?: { allowCached?: boolean }
   ): Promise<QuoteUsd | null> {
     const mint = mintAddress.trim();
     if (!mint) return null;
 
     this.startLiveSession(mint);
 
-    const cached = this.getCachedLiveQuote(mint);
-    if (cached) return cached;
+    const allowCached = options?.allowCached ?? true;
+    if (allowCached) {
+      const cached = this.getCachedLiveQuote(mint);
+      if (cached) return cached;
+    }
 
     try {
       return await firstValueFrom(
@@ -539,20 +554,27 @@ export class MarketDataService {
   async getExecutionQuoteUsd(
     mintAddress: string,
     previousQuote?: Partial<QuoteUsd>,
-    timeoutMs = 2200
+    timeoutMs = 2200,
+    options?: { forceFresh?: boolean }
   ): Promise<QuoteUsd | null> {
     const mint = mintAddress.trim();
     if (!mint) return null;
 
+    const forceFresh = options?.forceFresh ?? false;
     const baseline = this.normalizeReferenceQuote(previousQuote);
     const cached = this.getCachedLiveQuote(mint);
-    const canUseCached = cached && !this.isSevereDrop(cached, baseline);
+    const canUseCached = !forceFresh && cached && !this.isSevereDrop(cached, baseline);
 
     this.startLiveSession(mint);
 
     const liveQuotePromise = canUseCached
       ? Promise.resolve(cached)
-      : this.getLiveQuoteOnce(mint, previousQuote, Math.min(timeoutMs, 1400));
+      : this.getLiveQuoteOnce(
+          mint,
+          previousQuote,
+          forceFresh ? timeoutMs : Math.min(timeoutMs, 1400),
+          { allowCached: !forceFresh }
+        );
     const httpQuotePromise = this.getLatestQuoteUsd(mint, previousQuote);
 
     const [liveQuote, httpQuote] = await Promise.all([liveQuotePromise, httpQuotePromise]);
@@ -570,7 +592,7 @@ export class MarketDataService {
 
   async getTokenSnapshot(
     mintAddress: string,
-    options?: { useExecutionQuote?: boolean }
+    options?: { useExecutionQuote?: boolean; forceFreshQuote?: boolean }
   ): Promise<{
     mint: string;
     symbol: string;
@@ -583,7 +605,9 @@ export class MarketDataService {
       this.getTokenData(cleanMint),
       this.getPumpTraderToken(cleanMint),
       options?.useExecutionQuote
-        ? this.getExecutionQuoteUsd(cleanMint)
+        ? this.getExecutionQuoteUsd(cleanMint, undefined, 2600, {
+            forceFresh: options?.forceFreshQuote ?? false
+          })
         : this.getLatestQuoteUsd(cleanMint)
     ]);
 
