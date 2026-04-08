@@ -522,7 +522,7 @@ export class MarketDataService {
     mintAddress: string,
     _previousQuote?: Partial<QuoteUsd>,
     timeoutMs = 1800,
-    options?: { allowCached?: boolean }
+    options?: { allowCached?: boolean; minObservedAt?: number }
   ): Promise<QuoteUsd | null> {
     const mint = mintAddress.trim();
     if (!mint) return null;
@@ -530,15 +530,16 @@ export class MarketDataService {
     this.startLiveSession(mint);
 
     const allowCached = options?.allowCached ?? true;
+    const minObservedAt = options?.minObservedAt ?? 0;
     if (allowCached) {
       const cached = this.getCachedLiveQuote(mint);
-      if (cached) return cached;
+      if (cached && cached.observedAt >= minObservedAt) return cached;
     }
 
     try {
       return await firstValueFrom(
         this.tradeUpdates$.pipe(
-          filter(update => update.mint === mint),
+          filter(update => update.mint === mint && update.observedAt >= minObservedAt),
           map(({ mint: _mint, ...quote }) => quote),
           take(1),
           timeout({
@@ -561,6 +562,12 @@ export class MarketDataService {
     if (!mint) return null;
 
     const forceFresh = options?.forceFresh ?? false;
+    const requestedAt = Date.now();
+
+    if (forceFresh) {
+      this.clearLiveQuoteCache(mint);
+    }
+
     const baseline = this.normalizeReferenceQuote(previousQuote);
     const cached = this.getCachedLiveQuote(mint);
     const canUseCached = !forceFresh && cached && !this.isSevereDrop(cached, baseline);
@@ -573,12 +580,17 @@ export class MarketDataService {
           mint,
           previousQuote,
           forceFresh ? timeoutMs : Math.min(timeoutMs, 1400),
-          { allowCached: !forceFresh }
+          {
+            allowCached: !forceFresh,
+            minObservedAt: forceFresh ? requestedAt : 0
+          }
         );
-    const httpQuotePromise = this.getLatestQuoteUsd(mint, previousQuote);
+    const httpQuotePromise = this.getLatestQuoteUsd(mint, forceFresh ? undefined : previousQuote);
 
     const [liveQuote, httpQuote] = await Promise.all([liveQuotePromise, httpQuotePromise]);
-    const selected = this.selectExecutionQuote([liveQuote, httpQuote], baseline);
+    const selected = forceFresh
+      ? this.selectExecutionQuote([liveQuote, httpQuote], null)
+      : this.selectExecutionQuote([liveQuote, httpQuote], baseline);
     if (!selected) return null;
 
     this.latestLiveQuote = {

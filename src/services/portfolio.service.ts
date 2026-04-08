@@ -294,7 +294,9 @@ export class PortfolioService {
           priceUsd: pos.currentPrice,
           mcapUsd: pos.currentMcap,
           observedAt: pos.lastQuoteAt
-        }
+        },
+        3200,
+        { forceFresh: true }
       );
       if (!latest) {
         this.error.set("No live quote available right now. Click update or try again in a moment.");
@@ -352,7 +354,8 @@ export class PortfolioService {
           mcapUsd: pos.currentMcap,
           observedAt: pos.lastQuoteAt
         },
-        2000
+        2600,
+        { forceFresh: true }
       );
       if (!quote) {
         this.error.set('Unable to fetch current token price. Try again.');
