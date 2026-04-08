@@ -65,6 +65,7 @@ export class MarketDataService {
   private readonly websocketUrl = 'wss://pumpportal.fun/api/data';
   private readonly liveSessionMs = 90 * 1000;
   private readonly hotQuoteMaxAgeMs = 8000;
+  private readonly suspiciousDropRatio = 0.2;
 
   private solPriceUsd = 150;
   private socket$: WebSocketSubject<unknown> | null = null;
@@ -219,9 +220,19 @@ export class MarketDataService {
     const quote = await this.mapLivePayloadToQuote(payload);
     if (!quote) return;
 
+    const previous = this.latestLiveQuote?.mint === mint ? this.latestLiveQuote : null;
+    let nextQuote = quote;
+
+    if (previous && this.isSevereDrop(quote, previous)) {
+      const httpQuote = await this.getLatestQuoteUsd(mint, previous);
+      if (httpQuote && !this.isSevereDrop(httpQuote, previous)) {
+        nextQuote = httpQuote;
+      }
+    }
+
     const next: LiveTradeQuote = {
       mint,
-      ...quote
+      ...nextQuote
     };
 
     this.latestLiveQuote = next;
@@ -352,6 +363,82 @@ export class MarketDataService {
     return next;
   }
 
+  private normalizeReferenceQuote(quote?: Partial<QuoteUsd> | null): QuoteUsd | null {
+    const priceUsd = this.toNumber(quote?.priceUsd);
+    const mcapUsd = this.toNumber(quote?.mcapUsd);
+    const observedAt = this.toNumber(quote?.observedAt) ?? Date.now();
+
+    if (!priceUsd || priceUsd <= 0) return null;
+    if (!mcapUsd || mcapUsd <= 0) return null;
+
+    return {
+      priceUsd,
+      mcapUsd,
+      observedAt
+    };
+  }
+
+  private isValidQuote(quote: QuoteUsd | null | undefined): quote is QuoteUsd {
+    if (!quote) return false;
+    return (
+      Number.isFinite(quote.priceUsd) &&
+      quote.priceUsd > 0 &&
+      Number.isFinite(quote.mcapUsd) &&
+      quote.mcapUsd > 0 &&
+      Number.isFinite(quote.observedAt)
+    );
+  }
+
+  private isSevereDrop(next: QuoteUsd, baseline: QuoteUsd | null): boolean {
+    if (!baseline || !Number.isFinite(baseline.mcapUsd) || baseline.mcapUsd <= 0) return false;
+    return next.mcapUsd < baseline.mcapUsd * this.suspiciousDropRatio;
+  }
+
+  private pickQuoteClosestToBaseline(candidates: QuoteUsd[], baseline: QuoteUsd): QuoteUsd {
+    let best = candidates[0];
+    let bestDistance = Math.abs(Math.log(best.mcapUsd / baseline.mcapUsd));
+
+    for (let i = 1; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      const distance = Math.abs(Math.log(candidate.mcapUsd / baseline.mcapUsd));
+      if (distance < bestDistance) {
+        best = candidate;
+        bestDistance = distance;
+      }
+    }
+
+    return best;
+  }
+
+  private selectExecutionQuote(
+    candidates: (QuoteUsd | null | undefined)[],
+    baseline: QuoteUsd | null
+  ): QuoteUsd | null {
+    const valid = candidates.filter((quote): quote is QuoteUsd => this.isValidQuote(quote));
+    if (valid.length === 0) return null;
+
+    if (!baseline) {
+      if (valid.length > 1) {
+        const byMcap = [...valid].sort((a, b) => a.mcapUsd - b.mcapUsd);
+        const low = byMcap[0].mcapUsd;
+        const high = byMcap[byMcap.length - 1].mcapUsd;
+        if (low > 0 && high / low >= 5) {
+          return byMcap[byMcap.length - 1];
+        }
+      }
+
+      return valid.sort((a, b) => b.observedAt - a.observedAt)[0];
+    }
+
+    const nonSevere = valid.filter(quote => !this.isSevereDrop(quote, baseline));
+    if (nonSevere.length > 0) {
+      return this.pickQuoteClosestToBaseline(nonSevere, baseline);
+    }
+
+    // If all quotes are sharp drops, trust the freshest quote (fast crashes are possible).
+    return valid.sort((a, b) => b.observedAt - a.observedAt)[0];
+  }
+
   private getDexQuoteUsd(token: TokenData | null): QuoteUsd | null {
     const priceUsd = this.toNumber(token?.priceUsd);
     if (!priceUsd || priceUsd <= 0) return null;
@@ -393,7 +480,10 @@ export class MarketDataService {
     };
   }
 
-  async getLatestQuoteUsd(mintAddress: string): Promise<QuoteUsd | null> {
+  async getLatestQuoteUsd(
+    mintAddress: string,
+    previousQuote?: Partial<QuoteUsd> | null
+  ): Promise<QuoteUsd | null> {
     const [dexToken, pumpToken] = await Promise.all([
       this.getTokenData(mintAddress),
       this.getPumpTraderToken(mintAddress)
@@ -403,6 +493,10 @@ export class MarketDataService {
       this.getPumpQuoteUsd(pumpToken),
       Promise.resolve(this.getDexQuoteUsd(dexToken))
     ]);
+
+    const baseline = this.normalizeReferenceQuote(previousQuote);
+    const preferred = this.selectExecutionQuote([pumpQuote, dexQuote], baseline);
+    if (preferred) return preferred;
 
     return pumpQuote ?? dexQuote;
   }
@@ -447,19 +541,31 @@ export class MarketDataService {
     previousQuote?: Partial<QuoteUsd>,
     timeoutMs = 2200
   ): Promise<QuoteUsd | null> {
-    const cached = this.getCachedLiveQuote(mintAddress.trim());
-    if (cached) {
-      this.startLiveSession(mintAddress);
-      return cached;
-    }
+    const mint = mintAddress.trim();
+    if (!mint) return null;
 
-    this.startLiveSession(mintAddress);
+    const baseline = this.normalizeReferenceQuote(previousQuote);
+    const cached = this.getCachedLiveQuote(mint);
+    const canUseCached = cached && !this.isSevereDrop(cached, baseline);
 
-    const liveQuote = await this.getLiveQuoteOnce(mintAddress, previousQuote, Math.min(timeoutMs, 1400));
-    if (liveQuote) return liveQuote;
+    this.startLiveSession(mint);
 
-    const latestHttpQuote = await this.getLatestQuoteUsd(mintAddress);
-    return latestHttpQuote;
+    const liveQuotePromise = canUseCached
+      ? Promise.resolve(cached)
+      : this.getLiveQuoteOnce(mint, previousQuote, Math.min(timeoutMs, 1400));
+    const httpQuotePromise = this.getLatestQuoteUsd(mint, previousQuote);
+
+    const [liveQuote, httpQuote] = await Promise.all([liveQuotePromise, httpQuotePromise]);
+    const selected = this.selectExecutionQuote([liveQuote, httpQuote], baseline);
+    if (!selected) return null;
+
+    this.latestLiveQuote = {
+      mint,
+      ...selected
+    };
+    this.lastLiveQuoteAt.set(selected.observedAt);
+
+    return selected;
   }
 
   async getTokenSnapshot(

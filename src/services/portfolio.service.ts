@@ -36,6 +36,9 @@ export class PortfolioService {
   private readonly STORAGE_KEY = 'pump_sim_state_v2';
   private readonly LEGACY_STORAGE_KEYS = ['pump_sim_state_v1'];
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly suspiciousDropRatio = 0.2;
+  private readonly requiredLowTicksBeforeApply = 2;
+  private lowTickStrikes = new Map<string, number>();
 
   // Core State
   readonly cashBalance = signal<number>(100);
@@ -54,14 +57,7 @@ export class PortfolioService {
       .subscribe(update => {
         this.positions.update(currentPositions =>
           currentPositions.map(position =>
-            position.mint === update.mint
-              ? {
-                  ...position,
-                  currentPrice: update.priceUsd,
-                  currentMcap: update.mcapUsd,
-                  lastQuoteAt: update.observedAt
-                }
-              : position
+            position.mint === update.mint ? this.mergeLiveQuote(position, update) : position
           )
         );
       });
@@ -185,6 +181,7 @@ export class PortfolioService {
         this.positions.set(singlePosition);
 
         if (singlePosition.length > 0) {
+          this.lowTickStrikes.set(singlePosition[0].mint, 0);
           this.marketService.startLiveSession(singlePosition[0].mint);
         }
 
@@ -266,6 +263,7 @@ export class PortfolioService {
       }, ...h]);
 
       this.marketService.startLiveSession(snapshot.mint);
+      this.lowTickStrikes.set(snapshot.mint, 0);
 
       return true;
 
@@ -318,6 +316,7 @@ export class PortfolioService {
       }, ...h]);
 
       this.marketService.stopLiveSession();
+      this.lowTickStrikes.delete(pos.mint);
 
       return true;
 
@@ -385,7 +384,54 @@ export class PortfolioService {
     this.history.set([]);
     this.error.set(null);
     this.marketService.stopLiveSession();
+    this.lowTickStrikes.clear();
     localStorage.removeItem(this.STORAGE_KEY);
     this.LEGACY_STORAGE_KEYS.forEach(key => localStorage.removeItem(key));
+  }
+
+  private isValidIncomingQuote(priceUsd: number, mcapUsd: number): boolean {
+    return (
+      Number.isFinite(priceUsd) &&
+      priceUsd > 0 &&
+      Number.isFinite(mcapUsd) &&
+      mcapUsd > 0
+    );
+  }
+
+  private mergeLiveQuote(position: Position, update: { priceUsd: number; mcapUsd: number; observedAt: number }): Position {
+    if (!this.isValidIncomingQuote(update.priceUsd, update.mcapUsd)) {
+      return position;
+    }
+
+    const baselineMcap = position.currentMcap;
+    const isSuspiciousDrop =
+      Number.isFinite(baselineMcap) &&
+      baselineMcap > 0 &&
+      update.mcapUsd < baselineMcap * this.suspiciousDropRatio;
+
+    if (!isSuspiciousDrop) {
+      this.lowTickStrikes.set(position.mint, 0);
+      return {
+        ...position,
+        currentPrice: update.priceUsd,
+        currentMcap: update.mcapUsd,
+        lastQuoteAt: update.observedAt
+      };
+    }
+
+    const strikes = (this.lowTickStrikes.get(position.mint) ?? 0) + 1;
+    this.lowTickStrikes.set(position.mint, strikes);
+
+    if (strikes < this.requiredLowTicksBeforeApply) {
+      return position;
+    }
+
+    this.lowTickStrikes.set(position.mint, 0);
+    return {
+      ...position,
+      currentPrice: update.priceUsd,
+      currentMcap: update.mcapUsd,
+      lastQuoteAt: update.observedAt
+    };
   }
 }
