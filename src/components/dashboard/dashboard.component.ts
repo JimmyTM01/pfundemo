@@ -1,4 +1,4 @@
-import { Component, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule, FormBuilder, Validators } from '@angular/forms';
@@ -7,11 +7,13 @@ import { debounceTime, distinctUntilChanged, filter, map } from 'rxjs/operators'
 import { PortfolioService, Position } from '../../services/portfolio.service';
 import { MarketDataService } from '../../services/market-data.service';
 import { StatCardComponent } from '../ui/stat-card.component';
+import { BagPositionRowComponent } from './bag-position-row.component';
 
 @Component({
   selector: 'app-dashboard',
   standalone: true,
-  imports: [CommonModule, ReactiveFormsModule, StatCardComponent],
+  imports: [CommonModule, ReactiveFormsModule, StatCardComponent, BagPositionRowComponent],
+  changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="max-w-4xl mx-auto p-4 md:p-6 space-y-8 pb-24">
       
@@ -151,90 +153,17 @@ import { StatCardComponent } from '../ui/stat-card.component';
           <p class="text-slate-600 text-sm">Paste a mint address above to start losing (or winning) money.</p>
         </div>
 
-        <div *ngFor="let pos of portfolio.positions(); trackBy: trackByPositionId" class="card-glass rounded-xl p-4 md:p-6 transition-all hover:border-slate-500/50 group relative overflow-hidden">
-            <!-- Background Gradient based on PnL -->
-            <div class="absolute inset-0 opacity-10 pointer-events-none transition-colors duration-500"
-                 [class.bg-green-500]="getPnl(pos) >= 0"
-                 [class.bg-red-500]="getPnl(pos) < 0">
-            </div>
-
-            <div class="relative z-10 flex flex-col md:flex-row gap-4 md:items-center justify-between">
-              <!-- Token Info -->
-              <div class="flex items-center gap-4 min-w-[30%]">
-                <img [src]="pos.imageUrl" class="w-12 h-12 rounded-full border-2 border-slate-600 bg-slate-800 object-cover" alt="Token">
-                <div>
-                  <div class="font-bold text-lg leading-none mb-1">{{ pos.symbol }}</div>
-                  <div class="text-xs text-slate-400 font-mono truncate max-w-[150px]">{{ pos.mint }}</div>
-                  <div class="flex items-center gap-2 mt-1">
-                    <span class="text-xs text-slate-500">{{ pos.name }}</span>
-                    <span
-                      class="text-[10px] font-mono px-1.5 py-0.5 rounded border"
-                      [ngClass]="getPositionStatusClasses(pos)"
-                    >
-                      {{ isFeedActive(pos) ? 'LIVE' : 'IDLE' }}
-                    </span>
-                    <span class="text-[10px] text-slate-500 font-mono">
-                      {{ getTickAgeLabel(pos) }}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              <!-- Stats Grid -->
-              <div class="grid grid-cols-2 md:grid-cols-3 gap-y-2 gap-x-8 flex-grow">
-                <div>
-                  <div class="text-slate-500 text-xs">Invested</div>
-                  <div class="font-mono text-sm">{{ formatCurrency(pos.investedAmount) }}</div>
-                </div>
-                <div>
-                  <div class="text-slate-500 text-xs">Current Value</div>
-                  <div class="font-mono text-sm font-bold" [class]="getPnl(pos) >= 0 ? 'text-green-400' : 'text-red-400'">
-                    {{ formatCurrency(pos.amountTokens * pos.currentPrice) }}
-                  </div>
-                </div>
-                
-                <!-- Swapped Price for Market Cap as primary display -->
-                <div>
-                  <div class="text-slate-500 text-xs">Current MC</div>
-                  <div class="font-mono text-sm text-slate-300" [class]="pos.currentMcap > pos.entryMcap ? 'text-green-400' : 'text-red-400'">{{ formatMcap(pos.currentMcap) }}</div>
-                </div>
-                
-                <div>
-                  <div class="text-slate-500 text-xs">P&L</div>
-                  <div class="font-mono text-sm font-bold" [class]="getPnl(pos) >= 0 ? 'text-green-400' : 'text-red-400'">
-                    {{ (getPnl(pos) >= 0 ? '+' : '') }}{{ getPnlPercent(pos).toFixed(2) }}%
-                  </div>
-                </div>
-
-                 <!-- Entry MC - Made visible on all screens as requested -->
-                <div>
-                  <div class="text-slate-500 text-xs">Bought &#64; MC</div>
-                  <div class="font-mono text-sm text-slate-300">{{ formatMcap(pos.entryMcap) }}</div>
-                </div>
-                
-                <!-- Swapped Cur. MC for Price (Hidden on mobile) -->
-                <div class="hidden md:block">
-                   <div class="text-slate-500 text-xs">Price</div>
-                   <div class="font-mono text-sm text-slate-500">{{ formatPrice(pos.currentPrice) }}</div>
-                </div>
-              </div>
-
-              <!-- Action -->
-              <div class="flex flex-col gap-2 items-end md:min-w-[120px]">
-                 <button (click)="portfolio.refreshPosition(pos.id)"
-                    [disabled]="portfolio.isLoading() || portfolio.refreshingPositionId() === pos.id"
-                    class="w-full bg-slate-500/10 hover:bg-slate-500/20 text-slate-300 border border-slate-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">
-                   {{ portfolio.refreshingPositionId() === pos.id ? 'SYNCING...' : getUpdateLabel(pos) }}
-                 </button>
-                 <button (click)="portfolio.sellPosition(pos.id)" 
-                    [disabled]="portfolio.isLoading()"
-                    class="w-full bg-red-500/10 hover:bg-red-500 hover:text-white text-red-400 border border-red-500/30 py-2 px-4 rounded-lg font-bold text-sm transition-all disabled:opacity-50">
-                   <ng-container *ngIf="portfolio.sellingPositionId() === pos.id; else sellLabel">WAITING PRICE...</ng-container>
-                   <ng-template #sellLabel>{{ getSellLabel(pos) }}</ng-template>
-                 </button>
-          </div>
-        </div>
-      </div>
+        <app-bag-position-row
+          *ngFor="let pos of portfolio.positions(); trackBy: trackByPositionId"
+          [position]="pos"
+          [isLoading]="portfolio.isLoading()"
+          [isRefreshing]="portfolio.refreshingPositionId() === pos.id"
+          [isSelling]="portfolio.sellingPositionId() === pos.id"
+          [isFeedActive]="isFeedActive(pos)"
+          [isHot]="isLivePosition(pos)"
+          (refresh)="onRefreshPosition($event)"
+          (sell)="onSellPosition($event)"
+        ></app-bag-position-row>
       </div>
 
       <!-- Trade History -->
@@ -281,7 +210,7 @@ export class DashboardComponent {
   });
 
   constructor() {
-    interval(1000)
+    interval(3000)
       .pipe(takeUntilDestroyed())
       .subscribe(() => this.now.set(Date.now()));
 
@@ -367,6 +296,14 @@ export class DashboardComponent {
     this.buyForm.controls.amount.setValue(amount);
   }
 
+  onRefreshPosition(positionId: string) {
+    void this.portfolio.refreshPosition(positionId);
+  }
+
+  onSellPosition(positionId: string) {
+    void this.portfolio.sellPosition(positionId);
+  }
+
   private normalizeMint(value: string | null | undefined): string {
     return (value ?? '').trim();
   }
@@ -384,24 +321,10 @@ export class DashboardComponent {
     return this.market.isHotForMint(pos.mint);
   }
 
-  getUpdateLabel(pos: Position): string {
-    return this.isLivePosition(pos) ? 'SYNC NOW' : 'WAKE FEED';
-  }
-
-  getSellLabel(pos: Position): string {
-    return this.isLivePosition(pos) ? 'SELL NOW' : 'WAKE + SELL';
-  }
-
   getAmountPresetClasses(preset: number): string {
     return this.buyForm.controls.amount.getRawValue() === preset
       ? 'bg-purple-600 text-white border-purple-500'
       : 'bg-slate-800/60 text-slate-300 border-slate-600 hover:border-slate-500';
-  }
-
-  getPositionStatusClasses(pos: Position): string {
-    return this.isFeedActive(pos)
-      ? 'text-green-300 border-green-500/30 bg-green-500/10'
-      : 'text-slate-400 border-slate-600 bg-slate-800/70';
   }
 
   getFeedBadgeLabel(): string {
@@ -415,34 +338,8 @@ export class DashboardComponent {
     return `LIVE FEED ${secondsLeft}s`;
   }
 
-  getTickAgeLabel(pos: Position): string {
-    const deltaMs = Math.max(0, this.now() - pos.lastQuoteAt);
-
-    if (deltaMs < 1000) return 'tick now';
-    if (deltaMs < 60_000) return `tick ${(deltaMs / 1000).toFixed(1)}s ago`;
-
-    const minutes = Math.floor(deltaMs / 60_000);
-    return `tick ${minutes}m ago`;
-  }
-
-  // Helpers
-  getPnl(pos: Position): number {
-    return (pos.currentPrice * pos.amountTokens) - pos.investedAmount;
-  }
-
-  getPnlPercent(pos: Position): number {
-    const pnl = this.getPnl(pos);
-    if (pos.investedAmount === 0) return 0;
-    return (pnl / pos.investedAmount) * 100;
-  }
-
   formatCurrency(val: number): string {
     return '$' + val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  }
-
-  formatPrice(val: number): string {
-    if (val < 0.01) return '$' + val.toExponential(2);
-    return '$' + val.toFixed(4);
   }
 
   formatMcap(val: number): string {
